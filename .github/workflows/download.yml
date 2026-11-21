@@ -1,0 +1,57 @@
+name: Media Sync
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job Identifier'
+        required: true
+        type: string
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Cache Virtualenv
+        uses: actions/cache@v4
+        id: venv-cache
+        with:
+          path: ~/.venv
+          key: venv-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Dependencies
+        run: |
+          set +x
+          if [ ! -d ~/.venv ]; then
+            python -m venv ~/.venv
+            ~/.venv/bin/pip install --upgrade pip
+            ~/.venv/bin/pip install -r requirements.txt
+          fi
+
+      - name: Execute Silent Media Sync
+        env:
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          PLAYWRIGHT_CHROME_PATH: /usr/bin/google-chrome
+        run: |
+          set +x
+          ~/.venv/bin/python scripts/gh_worker.py
+
+      - name: Cleanup
+        if: always()
+        run: |
+          set +x
+          rm -rf /tmp/drivegrab /tmp/dg_* || true
