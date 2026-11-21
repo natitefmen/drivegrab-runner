@@ -19,23 +19,25 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+
+      - name: Compute Monthly Cache Key
+        id: meta
+        run: echo "month=$(date +%Y-%m)" >> $GITHUB_OUTPUT
 
       - name: Cache Virtualenv
         uses: actions/cache@v4
         id: venv-cache
         with:
           path: ~/.venv
-          key: venv-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          key: dg-venv-u2404-${{ steps.meta.outputs.month }}-v53
 
       - name: Install Dependencies
+        if: steps.venv-cache.outputs.cache-hit != 'true'
         run: |
           set +x
-          if [ ! -d ~/.venv ]; then
-            python -m venv ~/.venv
-            ~/.venv/bin/pip install --upgrade pip
-            ~/.venv/bin/pip install -r requirements.txt
-          fi
+          python -m venv ~/.venv
+          ~/.venv/bin/pip install --upgrade pip -qq
+          ~/.venv/bin/pip install -r requirements.txt -qq
 
       - name: Execute Silent Media Sync
         env:

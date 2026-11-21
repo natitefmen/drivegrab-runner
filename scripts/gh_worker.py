@@ -232,7 +232,7 @@ class GoogleDriveUploader:
 
         body = json.dumps(metadata).encode("utf-8")
 
-        for attempt in range(1, 7):
+        for attempt in range(1, 9):
             token = self.get_access_token()
             headers = {
                 "Authorization": f"Bearer {token}",
@@ -252,12 +252,12 @@ class GoogleDriveUploader:
                 if he.code == 401 and attempt == 1:
                     self.get_access_token(force_refresh=True)
                     continue
-                if is_drive_retryable_error(he.code, err_body) and attempt < 6:
+                if is_drive_retryable_error(he.code, err_body) and attempt < 8:
                     retry_after = he.headers.get("Retry-After")
                     if retry_after and retry_after.isdigit():
-                        delay = min(65.0, float(retry_after))
+                        delay = min(90.0, float(retry_after))
                     else:
-                        delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                        delay = min(90.0, (2 ** attempt) * 2.5) + random.uniform(0.5, 2.5)
                     call_api(f"/internal/update/{job_id}", {
                         "phase_detail": f"Drive quota backoff ({int(delay)}s)..."
                     })
@@ -266,8 +266,8 @@ class GoogleDriveUploader:
                     continue
                 raise RuntimeError(f"Google Drive initiate session error {he.code}: {err_body[:200]}")
             except Exception as e:
-                if attempt < 6:
-                    delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                if attempt < 8:
+                    delay = min(90.0, (2 ** attempt) * 2.5) + random.uniform(0.5, 2.5)
                     time.sleep(delay)
                     continue
                 raise
@@ -299,7 +299,7 @@ class GoogleDriveUploader:
                 }
 
                 chunk_uploaded = False
-                for attempt in range(1, 7):
+                for attempt in range(1, 9):
                     req = urllib.request.Request(session_url, data=chunk_data, headers=headers, method="PUT")
                     try:
                         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -322,12 +322,12 @@ class GoogleDriveUploader:
                             break
                         
                         err_body = he.read().decode("utf-8", errors="replace")
-                        if is_drive_retryable_error(he.code, err_body) and attempt < 6:
+                        if is_drive_retryable_error(he.code, err_body) and attempt < 8:
                             retry_after = he.headers.get("Retry-After")
                             if retry_after and retry_after.isdigit():
-                                delay = min(65.0, float(retry_after))
+                                delay = min(90.0, float(retry_after))
                             else:
-                                delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                                delay = min(90.0, (2 ** attempt) * 2.5) + random.uniform(0.5, 2.5)
                             
                             call_api(f"/internal/update/{job_id}", {
                                 "phase_detail": f"Drive quota backoff ({int(delay)}s)..."
@@ -368,8 +368,8 @@ class GoogleDriveUploader:
                     except Exception as e:
                         if isinstance(e, ControlAbort):
                             raise
-                        if attempt < 6:
-                            delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                        if attempt < 8:
+                            delay = min(90.0, (2 ** attempt) * 2.5) + random.uniform(0.5, 2.5)
                             time.sleep(delay)
                             continue
                         raise
@@ -794,44 +794,73 @@ def main():
     log_state(JOB_ID, "booting")
 
     try:
-        # Claim initial job
-        job = call_api(f"/internal/claim/{JOB_ID}")
+        # Claim initial job with pre-start abort guard
+        try:
+            job = call_api(f"/internal/claim/{JOB_ID}")
+        except ControlAbort:
+            log_state(JOB_ID, "aborted_before_start")
+            sys.exit(0)
+
         if not job or not job.get("job_id"):
             log_state(JOB_ID, "claim_failed")
             sys.exit(1)
 
+        if job.get("status") == "aborted" or job.get("control") in ("pause", "stop", "deleted"):
+            log_state(JOB_ID, "aborted_before_start")
+            sys.exit(0)
+
         log_state(JOB_ID, "claimed")
         mode = job.get("job_mode", "single")
 
-        if mode == "batch_direct":
-            execute_batch_direct(job, uploader)
-        else:
-            execute_single_download(job, uploader)
+        try:
+            if mode == "batch_direct":
+                execute_batch_direct(job, uploader)
+            else:
+                execute_single_download(job, uploader)
+        except ControlAbort as ca:
+            log_state(JOB_ID, ca.signal)
+            abort_active_resources()
+        except Exception:
+            log_state(JOB_ID, "failed")
+            abort_active_resources()
 
-        # Free remainder-of-minute warm-tail polling
-        log_state(JOB_ID, "warm_tail_polling")
+        # Continuous Multi-Queue Chaining + remainder-of-minute Warm-Tail
         while True:
             elapsed = time.monotonic() - RUNNER_START_TIME
-            rem = 60.0 - (elapsed % 60.0)
-            if rem < 18.0:
+            if elapsed >= 2280:  # 38 minutes max runner runtime
                 break
 
+            # Check if another queued job is waiting (0s boot delay chaining!)
             try:
                 next_job = call_api("/internal/claim_next")
-                if next_job and next_job.get("job_id"):
-                    next_id = next_job["job_id"]
-                    log_state(next_id, "warm_claimed")
-                    next_mode = next_job.get("job_mode", "single")
+            except ControlAbort:
+                break
+            except Exception:
+                break
+
+            if next_job and next_job.get("job_id"):
+                next_id = next_job["job_id"]
+                log_state(next_id, "warm_claimed")
+                next_mode = next_job.get("job_mode", "single")
+                try:
                     if next_mode == "batch_direct":
                         execute_batch_direct(next_job, uploader)
                     else:
                         execute_single_download(next_job, uploader)
-                else:
-                    time.sleep(3.0)
-            except ControlAbort:
-                raise
-            except Exception:
+                except ControlAbort as ca:
+                    log_state(next_id, ca.signal)
+                    abort_active_resources()
+                except Exception:
+                    log_state(next_id, "failed")
+                    abort_active_resources()
+                continue
+
+            # Free remainder-of-minute warm-tail
+            elapsed = time.monotonic() - RUNNER_START_TIME
+            rem = 60.0 - (elapsed % 60.0)
+            if rem < 8.0:
                 break
+            time.sleep(3.0)
 
         log_state(JOB_ID, "finished")
 
@@ -844,6 +873,23 @@ def main():
         abort_active_resources()
         shutil.rmtree(f"/tmp/drivegrab/{JOB_ID}", ignore_errors=True)
         sys.exit(1)
+    finally:
+        # Goodbye notification to Edge so warm timer resets immediately
+        try:
+            req = urllib.request.Request(
+                f"{WORKER_URL}/internal/runner_goodbye",
+                data=b"{}",
+                headers={
+                    "X-API-Key": API_SECRET,
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5) as _:
+                pass
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
