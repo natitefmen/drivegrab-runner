@@ -12,6 +12,7 @@ import subprocess
 import shutil
 import pathlib
 import mimetypes
+import random
 from typing import Optional, List, Dict, Any, Tuple
 
 # Configuration
@@ -23,14 +24,51 @@ GDRIVE_CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID", "").strip()
 GDRIVE_CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "").strip()
 GDRIVE_REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()
 
-CHUNK_SIZE = 64 * 1024 * 1024  # 64 MiB chunks for Google Drive Resumable Upload
+CHUNK_SIZE = 128 * 1024 * 1024  # 128 MiB (134,217,728 bytes, exact multiple of 256 KiB)
 RUNNER_START_TIME = time.monotonic()
 
+_CURRENT_SUBPROC: Optional[subprocess.Popen] = None
+_CURRENT_SESSION_URL: Optional[str] = None
 
-def log_state(job_id: str, state: str) -> None:
-    """Strictly silent public log: prints ONLY opaque job_id prefix and state name."""
+
+class ControlAbort(Exception):
+    """Raised when Cloudflare Edge returns a control signal to abort execution cooperatively."""
+    def __init__(self, signal: str):
+        self.signal = signal
+        super().__init__(f"Aborted by control signal: {signal}")
+
+
+def abort_active_resources(session_url: Optional[str] = None) -> None:
+    global _CURRENT_SUBPROC, _CURRENT_SESSION_URL
+    if _CURRENT_SUBPROC and _CURRENT_SUBPROC.poll() is None:
+        try:
+            _CURRENT_SUBPROC.terminate()
+            _CURRENT_SUBPROC.wait(timeout=2.0)
+        except Exception:
+            try:
+                _CURRENT_SUBPROC.kill()
+            except Exception:
+                pass
+        _CURRENT_SUBPROC = None
+
+    target_session = session_url or _CURRENT_SESSION_URL
+    if target_session:
+        try:
+            req = urllib.request.Request(target_session, headers={"Content-Length": "0"}, method="DELETE")
+            with urllib.request.urlopen(req, timeout=10) as _:
+                pass
+        except Exception:
+            pass
+        _CURRENT_SESSION_URL = None
+
+
+def log_state(job_id: str, state: str, code: Optional[str] = None) -> None:
+    """Strictly silent public log: prints ONLY opaque job_id prefix and state name (and optional code)."""
     jid = job_id[:8] if job_id else "unknown"
-    sys.stdout.write(f"[dg] job={jid} state={state}\n")
+    if code:
+        sys.stdout.write(f"[dg] job={jid} state={state} code={code}\n")
+    else:
+        sys.stdout.write(f"[dg] job={jid} state={state}\n")
     sys.stdout.flush()
 
 
@@ -43,6 +81,28 @@ def sanitize_text(text: str) -> str:
             cleaned = cleaned.replace(secret, "[REDACTED]")
     cleaned = re.sub(r'(\?|&)(token|key|sig|secret|auth|signature)=[^&\s]+', r'\1\2=[REDACTED]', cleaned, flags=re.IGNORECASE)
     return cleaned[:1000]
+
+
+def is_drive_retryable_error(status: int, body: str) -> bool:
+    """Checks whether a Google Drive error should trigger exponential backoff retry."""
+    if "storageQuotaExceeded" in body:
+        return False
+    if status in (429, 500, 502, 503, 504):
+        return True
+    if status == 403:
+        b_low = body.lower()
+        b_no_space = b_low.replace(" ", "")
+        retryable_tokens = (
+            "ratelimitexceeded",
+            "userratelimitexceeded",
+            "quota exceeded",
+            "quotaexceeded",
+            "queries",
+            "backenderror",
+            "sharingratelimitexceeded"
+        )
+        return any(t in b_low or t in b_no_space for t in retryable_tokens)
+    return False
 
 
 def is_ssrf_safe_url(url_str: str) -> bool:
@@ -105,24 +165,34 @@ def call_api(endpoint: str, data: Optional[dict] = None) -> dict:
     if req_body:
         headers["Content-Type"] = "application/json"
 
+    res_data: dict = {}
     for attempt in range(1, 4):
         try:
             req = urllib.request.Request(url, data=req_body, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=30) as resp:
                 if resp.status == 204:
-                    return {}
+                    res_data = {}
+                    break
                 resp_bytes = resp.read()
-                return json.loads(resp_bytes.decode("utf-8")) if resp_bytes else {}
+                res_data = json.loads(resp_bytes.decode("utf-8")) if resp_bytes else {}
+                break
         except urllib.error.HTTPError as he:
             if he.code == 204:
-                return {}
+                res_data = {}
+                break
             if attempt == 3:
                 raise
         except Exception:
             if attempt == 3:
                 raise
         time.sleep(1.5 * attempt)
-    return {}
+
+    # Check for cooperative control signal
+    control = res_data.get("control", "")
+    if control in ("pause", "stop", "deleted"):
+        raise ControlAbort(control)
+
+    return res_data
 
 
 class GoogleDriveUploader:
@@ -133,9 +203,9 @@ class GoogleDriveUploader:
         self.access_token: Optional[str] = None
         self.token_expiry: float = 0.0
 
-    def get_access_token(self) -> str:
+    def get_access_token(self, force_refresh: bool = False) -> str:
         now = time.monotonic()
-        if self.access_token and now < self.token_expiry - 60:
+        if not force_refresh and self.access_token and now < self.token_expiry - 60:
             return self.access_token
 
         token_url = "https://oauth2.googleapis.com/token"
@@ -154,40 +224,64 @@ class GoogleDriveUploader:
             self.token_expiry = now + expires_in
             return self.access_token
 
-    def initiate_resumable_session(self, filename: str, folder_id: str, content_type: str, file_size: int) -> str:
-        token = self.get_access_token()
+    def initiate_resumable_session(self, filename: str, folder_id: str, content_type: str, file_size: int, job_id: str) -> str:
         url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
-        
         metadata: Dict[str, Any] = {"name": filename}
         if folder_id and folder_id != "root":
             metadata["parents"] = [folder_id]
 
         body = json.dumps(metadata).encode("utf-8")
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json; charset=UTF-8",
-            "X-Upload-Content-Type": content_type or "application/octet-stream",
-            "X-Upload-Content-Length": str(file_size)
-        }
 
-        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                loc = resp.headers.get("Location")
-                if not loc:
-                    raise RuntimeError("No Location header returned in Google Drive resumable session")
-                return loc
-        except urllib.error.HTTPError as he:
-            err_body = he.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Google Drive initiate session error {he.code}: {err_body[:200]}")
+        for attempt in range(1, 7):
+            token = self.get_access_token()
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Upload-Content-Type": content_type or "application/octet-stream",
+                "X-Upload-Content-Length": str(file_size)
+            }
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    loc = resp.headers.get("Location")
+                    if not loc:
+                        raise RuntimeError("No Location header returned in Google Drive resumable session")
+                    return loc
+            except urllib.error.HTTPError as he:
+                err_body = he.read().decode("utf-8", errors="replace")
+                if he.code == 401 and attempt == 1:
+                    self.get_access_token(force_refresh=True)
+                    continue
+                if is_drive_retryable_error(he.code, err_body) and attempt < 6:
+                    retry_after = he.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        delay = min(65.0, float(retry_after))
+                    else:
+                        delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                    call_api(f"/internal/update/{job_id}", {
+                        "phase_detail": f"Drive quota backoff ({int(delay)}s)..."
+                    })
+                    log_state(job_id, "retry_backoff", f"DRIVE_{he.code}")
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"Google Drive initiate session error {he.code}: {err_body[:200]}")
+            except Exception as e:
+                if attempt < 6:
+                    delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                    time.sleep(delay)
+                    continue
+                raise
+        raise RuntimeError("Google Drive initiate session failed after retries")
 
     def upload_file(self, file_path: str, filename: str, folder_id: str, job_id: str, on_progress=None) -> Dict[str, Any]:
+        global _CURRENT_SESSION_URL
         file_size = os.path.getsize(file_path)
         content_type, _ = mimetypes.guess_type(file_path)
         if not content_type:
             content_type = "video/mp4" if file_path.lower().endswith((".mp4", ".mkv", ".webm")) else "application/octet-stream"
 
-        session_url = self.initiate_resumable_session(filename, folder_id, content_type, file_size)
+        session_url = self.initiate_resumable_session(filename, folder_id, content_type, file_size, job_id)
+        _CURRENT_SESSION_URL = session_url
 
         offset = 0
         last_report = time.monotonic()
@@ -204,26 +298,81 @@ class GoogleDriveUploader:
                     "Content-Range": f"bytes {offset}-{end}/{file_size}"
                 }
 
-                req = urllib.request.Request(session_url, data=chunk_data, headers=headers, method="PUT")
-                try:
-                    with urllib.request.urlopen(req, timeout=120) as resp:
-                        if resp.status in (200, 201):
-                            data = json.loads(resp.read().decode("utf-8"))
-                            return data
-                except urllib.error.HTTPError as he:
-                    if he.code == 308:
-                        range_hdr = he.headers.get("Range")
-                        if range_hdr:
-                            m = re.search(r'bytes=0-(\d+)', range_hdr)
-                            if m:
-                                offset = int(m.group(1)) + 1
+                chunk_uploaded = False
+                for attempt in range(1, 7):
+                    req = urllib.request.Request(session_url, data=chunk_data, headers=headers, method="PUT")
+                    try:
+                        with urllib.request.urlopen(req, timeout=120) as resp:
+                            if resp.status in (200, 201):
+                                data = json.loads(resp.read().decode("utf-8"))
+                                _CURRENT_SESSION_URL = None
+                                return data
+                    except urllib.error.HTTPError as he:
+                        if he.code == 308:
+                            range_hdr = he.headers.get("Range")
+                            if range_hdr:
+                                m = re.search(r'bytes=0-(\d+)', range_hdr)
+                                if m:
+                                    offset = int(m.group(1)) + 1
+                                else:
+                                    offset += chunk_len
                             else:
                                 offset += chunk_len
-                        else:
-                            offset += chunk_len
-                    else:
+                            chunk_uploaded = True
+                            break
+                        
                         err_body = he.read().decode("utf-8", errors="replace")
+                        if is_drive_retryable_error(he.code, err_body) and attempt < 6:
+                            retry_after = he.headers.get("Retry-After")
+                            if retry_after and retry_after.isdigit():
+                                delay = min(65.0, float(retry_after))
+                            else:
+                                delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                            
+                            call_api(f"/internal/update/{job_id}", {
+                                "phase_detail": f"Drive quota backoff ({int(delay)}s)..."
+                            })
+                            log_state(job_id, "retry_backoff", f"DRIVE_{he.code}")
+                            time.sleep(delay)
+
+                            # Probe session offset with empty Content-Range
+                            probe_req = urllib.request.Request(
+                                session_url,
+                                data=b"",
+                                headers={"Content-Range": f"bytes */{file_size}"},
+                                method="PUT"
+                            )
+                            try:
+                                with urllib.request.urlopen(probe_req, timeout=30) as p_resp:
+                                    if p_resp.status in (200, 201):
+                                        data = json.loads(p_resp.read().decode("utf-8"))
+                                        _CURRENT_SESSION_URL = None
+                                        return data
+                            except urllib.error.HTTPError as p_he:
+                                if p_he.code == 308:
+                                    p_range = p_he.headers.get("Range")
+                                    if p_range:
+                                        pm = re.search(r'bytes=0-(\d+)', p_range)
+                                        if pm:
+                                            offset = int(pm.group(1)) + 1
+                                            f.seek(offset)
+                                            chunk_data = f.read(CHUNK_SIZE)
+                                            chunk_len = len(chunk_data)
+                                            end = offset + chunk_len - 1
+                                            headers = {
+                                                "Content-Length": str(chunk_len),
+                                                "Content-Range": f"bytes {offset}-{end}/{file_size}"
+                                            }
+                            continue
                         raise RuntimeError(f"Google Drive chunk upload error {he.code}: {err_body[:200]}")
+                    except Exception as e:
+                        if isinstance(e, ControlAbort):
+                            raise
+                        if attempt < 6:
+                            delay = min(60.0, (2 ** attempt) * 2.0) + random.uniform(0.3, 1.8)
+                            time.sleep(delay)
+                            continue
+                        raise
 
                 now = time.monotonic()
                 if now - last_report >= 2.0:
@@ -232,6 +381,7 @@ class GoogleDriveUploader:
                     if on_progress:
                         on_progress(pct, offset, file_size)
 
+        _CURRENT_SESSION_URL = None
         return {}
 
 
@@ -252,14 +402,19 @@ def rebuild_video(input_path: str) -> str:
         "-movflags", "+faststart",
         rebuilt_path
     ]
+    global _CURRENT_SUBPROC
     try:
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=600)
-        if res.returncode == 0 and os.path.exists(rebuilt_path) and os.path.getsize(rebuilt_path) > 10240:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        _CURRENT_SUBPROC = proc
+        proc.wait(timeout=600)
+        _CURRENT_SUBPROC = None
+        if proc.returncode == 0 and os.path.exists(rebuilt_path) and os.path.getsize(rebuilt_path) > 10240:
             shutil.move(rebuilt_path, input_path)
             return input_path
     except Exception:
         pass
     finally:
+        _CURRENT_SUBPROC = None
         if os.path.exists(rebuilt_path):
             try:
                 os.remove(rebuilt_path)
@@ -402,6 +557,7 @@ def resolve_with_playwright(candidate_urls: List[str], page_url: Optional[str], 
 
 
 def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) -> None:
+    global _CURRENT_SUBPROC
     job_id = job["job_id"]
     raw_url = job.get("url", "")
     folder_id = job.get("folder_id", "root")
@@ -442,7 +598,20 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             cmd.extend(["--add-header", f"Cookie:{cookies}"])
         cmd.extend(["--", raw_url])
 
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=2400)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        _CURRENT_SUBPROC = proc
+        last_hb = time.monotonic()
+        while proc.poll() is None:
+            time.sleep(0.5)
+            now = time.monotonic()
+            if now - last_hb >= 2.0:
+                last_hb = now
+                call_api(f"/internal/update/{job_id}", {
+                    "status": "downloading",
+                    "phase_detail": "Downloading via runner"
+                })
+        _CURRENT_SUBPROC = None
+        stderr_text = proc.stderr.read() if proc.stderr else ""
         success = (proc.returncode == 0)
 
         # Fallback to Playwright if stream resolution failed
@@ -459,11 +628,24 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                     "-o", out_tmpl,
                     "--", stream_url
                 ]
-                proc_pw = subprocess.run(cmd_pw, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=2400)
+                proc_pw = subprocess.Popen(cmd_pw, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                _CURRENT_SUBPROC = proc_pw
+                last_hb = time.monotonic()
+                while proc_pw.poll() is None:
+                    time.sleep(0.5)
+                    now = time.monotonic()
+                    if now - last_hb >= 2.0:
+                        last_hb = now
+                        call_api(f"/internal/update/{job_id}", {
+                            "status": "downloading",
+                            "phase_detail": "Downloading via runner"
+                        })
+                _CURRENT_SUBPROC = None
+                stderr_text = proc_pw.stderr.read() if proc_pw.stderr else ""
                 success = (proc_pw.returncode == 0)
 
         if not success:
-            err_msg = proc.stderr[-400:] if proc.stderr else "Download failed"
+            err_msg = stderr_text[-400:] if stderr_text else "Download failed"
             raise RuntimeError(sanitize_text(err_msg))
 
         downloaded_files = [f for f in pathlib.Path(job_dir).rglob("*") if f.is_file()]
@@ -489,7 +671,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             "status": "uploading_to_gdrive",
             "filename": final_fn,
             "total_bytes": fsize,
-            "phase_detail": "Uploading to Google Drive (64 MiB chunks)"
+            "phase_detail": "Uploading to Google Drive (128 MiB chunks)"
         })
 
         def on_upload_prog(pct, uploaded_b, tot_b):
@@ -513,6 +695,9 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             "phase_detail": "Saved to Drive"
         })
 
+    except ControlAbort:
+        abort_active_resources()
+        raise
     except Exception as e:
         log_state(job_id, "failed")
         clean_err = sanitize_text(str(e))
@@ -526,6 +711,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
 
 
 def execute_batch_direct(job: Dict[str, Any], uploader: GoogleDriveUploader) -> None:
+    global _CURRENT_SUBPROC
     job_id = job["job_id"]
     batch_id = job.get("batch_id", "")
     folder_id = job.get("folder_id", "root")
@@ -536,51 +722,67 @@ def execute_batch_direct(job: Dict[str, Any], uploader: GoogleDriveUploader) -> 
     completed = 0
     total = len(items)
 
-    for idx, item in enumerate(items):
-        item_url = item.get("url", "")
-        item_fn = item.get("filename") or item.get("title") or f"file_{idx+1}.mp4"
-        safe_fn = sanitize_filename(item_fn)
-
-        item_job_id = f"{job_id}_{idx}"
-        job_dir = f"/tmp/drivegrab/{item_job_id}"
-        os.makedirs(job_dir, exist_ok=True)
-        try:
-            log_state(job_id, f"item_{idx+1}_of_{total}")
-            dest_path = os.path.join(job_dir, safe_fn)
-
-            # Download using curl
-            curl_cmd = ["curl", "-sSL", "-o", dest_path, item_url]
-            if item.get("extra_cookie"):
-                curl_cmd.extend(["-H", f"Cookie: {item['extra_cookie']}"])
-            subprocess.run(curl_cmd, check=True, timeout=1200)
-
-            if os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024:
-                if dest_path.lower().endswith((".mp4", ".mkv", ".webm")):
-                    dest_path = rebuild_video(dest_path)
-                uploader.upload_file(dest_path, safe_fn, folder_id, job_id)
-                completed += 1
-
-            prog = round((completed / total) * 100.0, 1)
+    try:
+        for idx, item in enumerate(items):
+            # Check control signal before each item
             call_api(f"/internal/update/{job_id}", {
-                "progress": prog,
-                "phase_detail": f"Processed {completed}/{total} items"
+                "status": "downloading",
+                "phase_detail": f"Processing item {idx+1}/{total}"
             })
-            if batch_id:
-                call_api(f"/internal/batch_update/{batch_id}", {
-                    "completed_count": completed,
-                    "active_detail": f"Completed {completed}/{total}"
-                })
-        except Exception:
-            pass
-        finally:
-            shutil.rmtree(job_dir, ignore_errors=True)
 
-    log_state(job_id, "completed")
-    call_api(f"/internal/update/{job_id}", {
-        "status": "completed",
-        "progress": 100.0,
-        "phase_detail": f"Batch completed ({completed}/{total} uploaded)"
-    })
+            item_url = item.get("url", "")
+            item_fn = item.get("filename") or item.get("title") or f"file_{idx+1}.mp4"
+            safe_fn = sanitize_filename(item_fn)
+
+            item_job_id = f"{job_id}_{idx}"
+            job_dir = f"/tmp/drivegrab/{item_job_id}"
+            os.makedirs(job_dir, exist_ok=True)
+            try:
+                log_state(job_id, f"item_{idx+1}_of_{total}")
+                dest_path = os.path.join(job_dir, safe_fn)
+
+                curl_cmd = ["curl", "-sSL", "-o", dest_path, item_url]
+                if item.get("extra_cookie"):
+                    curl_cmd.extend(["-H", f"Cookie: {item['extra_cookie']}"])
+
+                proc = subprocess.Popen(curl_cmd)
+                _CURRENT_SUBPROC = proc
+                proc.wait(timeout=1200)
+                _CURRENT_SUBPROC = None
+
+                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024:
+                    if dest_path.lower().endswith((".mp4", ".mkv", ".webm")):
+                        dest_path = rebuild_video(dest_path)
+                    uploader.upload_file(dest_path, safe_fn, folder_id, job_id)
+                    completed += 1
+
+                prog = round((completed / total) * 100.0, 1)
+                call_api(f"/internal/update/{job_id}", {
+                    "progress": prog,
+                    "phase_detail": f"Processed {completed}/{total} items"
+                })
+                if batch_id:
+                    call_api(f"/internal/batch_update/{batch_id}", {
+                        "completed_count": completed,
+                        "active_detail": f"Completed {completed}/{total}"
+                    })
+            except ControlAbort:
+                raise
+            except Exception:
+                pass
+            finally:
+                _CURRENT_SUBPROC = None
+                shutil.rmtree(job_dir, ignore_errors=True)
+
+        log_state(job_id, "completed")
+        call_api(f"/internal/update/{job_id}", {
+            "status": "completed",
+            "progress": 100.0,
+            "phase_detail": f"Batch completed ({completed}/{total} uploaded)"
+        })
+    except ControlAbort:
+        abort_active_resources()
+        raise
 
 
 def main():
@@ -591,47 +793,57 @@ def main():
     uploader = GoogleDriveUploader(GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET, GDRIVE_REFRESH_TOKEN)
     log_state(JOB_ID, "booting")
 
-    # Claim initial job
-    job = call_api(f"/internal/claim/{JOB_ID}")
-    if not job or not job.get("job_id"):
-        log_state(JOB_ID, "claim_failed")
-        sys.exit(1)
-
-    log_state(JOB_ID, "claimed")
-    mode = job.get("job_mode", "single")
-
     try:
+        # Claim initial job
+        job = call_api(f"/internal/claim/{JOB_ID}")
+        if not job or not job.get("job_id"):
+            log_state(JOB_ID, "claim_failed")
+            sys.exit(1)
+
+        log_state(JOB_ID, "claimed")
+        mode = job.get("job_mode", "single")
+
         if mode == "batch_direct":
             execute_batch_direct(job, uploader)
         else:
             execute_single_download(job, uploader)
-    except Exception:
-        sys.exit(1)
 
-    # Free remainder-of-minute warm-tail polling
-    log_state(JOB_ID, "warm_tail_polling")
-    while True:
-        elapsed = time.monotonic() - RUNNER_START_TIME
-        rem = 60.0 - (elapsed % 60.0)
-        if rem < 18.0:
-            break
+        # Free remainder-of-minute warm-tail polling
+        log_state(JOB_ID, "warm_tail_polling")
+        while True:
+            elapsed = time.monotonic() - RUNNER_START_TIME
+            rem = 60.0 - (elapsed % 60.0)
+            if rem < 18.0:
+                break
 
-        try:
-            next_job = call_api("/internal/claim_next")
-            if next_job and next_job.get("job_id"):
-                next_id = next_job["job_id"]
-                log_state(next_id, "warm_claimed")
-                next_mode = next_job.get("job_mode", "single")
-                if next_mode == "batch_direct":
-                    execute_batch_direct(next_job, uploader)
+            try:
+                next_job = call_api("/internal/claim_next")
+                if next_job and next_job.get("job_id"):
+                    next_id = next_job["job_id"]
+                    log_state(next_id, "warm_claimed")
+                    next_mode = next_job.get("job_mode", "single")
+                    if next_mode == "batch_direct":
+                        execute_batch_direct(next_job, uploader)
+                    else:
+                        execute_single_download(next_job, uploader)
                 else:
-                    execute_single_download(next_job, uploader)
-            else:
-                time.sleep(3.0)
-        except Exception:
-            break
+                    time.sleep(3.0)
+            except ControlAbort:
+                raise
+            except Exception:
+                break
 
-    log_state(JOB_ID, "finished")
+        log_state(JOB_ID, "finished")
+
+    except ControlAbort as ca:
+        log_state(JOB_ID, ca.signal)
+        abort_active_resources()
+        shutil.rmtree(f"/tmp/drivegrab/{JOB_ID}", ignore_errors=True)
+        sys.exit(0)
+    except Exception:
+        abort_active_resources()
+        shutil.rmtree(f"/tmp/drivegrab/{JOB_ID}", ignore_errors=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
