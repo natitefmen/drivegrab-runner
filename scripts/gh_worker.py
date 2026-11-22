@@ -15,6 +15,7 @@ import mimetypes
 import random
 import threading
 import collections
+import base64
 from typing import Optional, List, Dict, Any, Tuple
 
 # Configuration
@@ -453,7 +454,7 @@ def rebuild_video(input_path: str) -> str:
     ]
     global _CURRENT_SUBPROC
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _CURRENT_SUBPROC = proc
         proc.wait(timeout=600)
         _CURRENT_SUBPROC = None
@@ -512,6 +513,21 @@ def verify_video_integrity(file_path: str) -> bool:
         return False
 
 
+def _parse_size_bytes(val_str: str, unit_str: str) -> int:
+    try:
+        val = float(val_str)
+        u = unit_str.upper().strip()
+        if "G" in u:
+            return int(val * 1024 * 1024 * 1024)
+        if "M" in u:
+            return int(val * 1024 * 1024)
+        if "K" in u:
+            return int(val * 1024)
+        return int(val)
+    except Exception:
+        return 0
+
+
 def parse_dg_progress_line(line: str) -> Optional[Dict[str, Any]]:
     if not line:
         return None
@@ -553,6 +569,35 @@ def parse_dg_progress_line(line: str) -> Optional[Dict[str, Any]]:
                 "speed_text": speed_text
             }
 
+    # aria2c console progress line: [#abc123 64MiB/250MiB(25%) CN:16 DL:18.4MiB]
+    m_aria = re.search(
+        r'\[#[0-9a-fA-F]+\s+([\d\.]+)\s*([A-Za-z]+)/([\d\.]+)\s*([A-Za-z]+)\((\d+(?:\.\d+)?)%\)(?:.*?DL:([\d\.]+)\s*([A-Za-z/]+))?',
+        line_clean
+    )
+    if not m_aria:
+        m_aria = re.search(
+            r'([\d\.]+)\s*([A-Za-z]+)/([\d\.]+)\s*([A-Za-z]+)\((\d+(?:\.\d+)?)%\).*?DL:([\d\.]+)\s*([A-Za-z/]+)',
+            line_clean
+        )
+    if m_aria:
+        dl_val, dl_unit, tot_val, tot_unit, pct_str, spd_val, spd_unit = m_aria.groups()
+        dl_bytes = _parse_size_bytes(dl_val, dl_unit)
+        tot_bytes = _parse_size_bytes(tot_val, tot_unit)
+        try:
+            dl_pct = float(pct_str)
+        except Exception:
+            dl_pct = 0.0
+        speed_text = ""
+        if spd_val and spd_unit:
+            u_clean = spd_unit.upper().replace("/S", "").replace("I", "").strip()
+            speed_text = f"{spd_val} {u_clean}/s"
+        return {
+            "dl_pct": min(100.0, max(0.0, dl_pct)),
+            "downloaded_bytes": dl_bytes,
+            "total_bytes": tot_bytes,
+            "speed_text": speed_text
+        }
+
     m = re.search(r'\[download\]\s+([\d\.]+)%\s+of\s+~?([\d\.]+\s*[KMG]i?B)(?:\s+at\s+([\d\.]+\s*[KMG]i?B/s))?', line_clean)
     if m:
         try:
@@ -586,7 +631,9 @@ def build_ytdlp_cmd(
     target_height: int = 1080,
     user_agent: Optional[str] = None,
     referer: Optional[str] = None,
-    cookies: Optional[str] = None
+    cookies: Optional[str] = None,
+    use_aria2: bool = True,
+    impersonate: Optional[str] = None,
 ) -> List[str]:
     format_spec = f"bv*[height<={target_height}][ext=mp4]+ba[ext=m4a]/b[height<={target_height}][ext=mp4]/bv*[height<={target_height}]+ba/b[height<={target_height}]/best"
     cmd = [
@@ -605,12 +652,33 @@ def build_ytdlp_cmd(
         "-P", job_dir,
         "-o", out_tmpl,
     ]
-    if user_agent:
+
+    parsed_path = (urllib.parse.urlparse(target_url).path or "").lower()
+    url_low = target_url.lower()
+    is_manifest = parsed_path.endswith((".m3u8", ".m3u", ".mpd"))
+    is_tokenized_php = (
+        parsed_path.endswith(".php")
+        or "acctoken=" in url_low
+        or "download=true" in url_low
+        or "/get_file/" in parsed_path
+    )
+
+    if use_aria2 and not is_manifest and not is_tokenized_php and shutil.which("aria2c"):
+        cmd.extend([
+            "--downloader", "http,https:aria2c",
+            "--downloader-args", "aria2c:-x 16 -s 16 -k 1M --disable-ipv6=true --file-allocation=none --connect-timeout=20 --timeout=30 --max-tries=5 --retry-wait=2 --show-console-readout=true --summary-interval=1"
+        ])
+
+    if impersonate:
+        cmd.extend(["--impersonate", impersonate])
+    elif user_agent:
         cmd.extend(["--user-agent", user_agent])
+
     if referer:
         cmd.extend(["--add-header", f"Referer:{referer}"])
     if cookies:
         cmd.extend(["--add-header", f"Cookie:{cookies}"])
+
     cmd.extend(["--", target_url])
     return cmd
 
@@ -625,6 +693,7 @@ def run_process_with_heartbeat(
     global _CURRENT_SUBPROC
     proc = subprocess.Popen(
         cmd,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -677,7 +746,7 @@ def run_process_with_heartbeat(
 
                 update_payload: Dict[str, Any] = {
                     "progress": overall_prog,
-                    "phase_detail": f"Downloading ({dl_pct:.0f}%)" if dl_pct > 0 else phase_detail
+                    "phase_detail": "Downloading" if dl_pct > 0 else phase_detail
                 }
                 if cur_prog.get("downloaded_bytes"):
                     update_payload["downloaded_bytes"] = cur_prog["downloaded_bytes"]
@@ -1159,6 +1228,363 @@ def execute_linkgrabber_analyze(job: Dict[str, Any]) -> None:
     })
 
 
+ALLOWED_SIGN_HOSTS = [
+    base64.b64decode(b'Y2RuLmNy').decode(),
+    base64.b64decode(b'YnVua3IuY3I=').decode(),
+    base64.b64decode(b'YnVua3IuaXM=').decode(),
+    base64.b64decode(b'YnVua3Iuc2k=').decode(),
+    base64.b64decode(b'YnVua3IudG8=').decode(),
+    base64.b64decode(b'YnVua3JyLnN1').decode(),
+]
+
+_CYBERDROP_DIR_FLAG: Optional[str] = None
+
+
+def _strip_media_ext(name: str) -> str:
+    known = (
+        ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts",
+        ".avi", ".flv", ".zip", ".rar", ".7z"
+    )
+    low = name.lower()
+    for ext in known:
+        if low.endswith(ext):
+            return name[:-len(ext)]
+    return name
+
+
+def _detect_cyberdrop_dir_flag(cyberdrop_bin: str) -> str:
+    global _CYBERDROP_DIR_FLAG
+    if _CYBERDROP_DIR_FLAG:
+        return _CYBERDROP_DIR_FLAG
+    try:
+        res = subprocess.run(
+            [cyberdrop_bin, "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10
+        )
+        help_text = (res.stdout or "") + (res.stderr or "")
+        if "--download-folder" in help_text:
+            _CYBERDROP_DIR_FLAG = "--download-folder"
+        elif "-d" in help_text or "--dir" in help_text:
+            _CYBERDROP_DIR_FLAG = "-d"
+        elif "-o" in help_text or "--output" in help_text:
+            _CYBERDROP_DIR_FLAG = "-o"
+        else:
+            _CYBERDROP_DIR_FLAG = "--download-folder"
+    except Exception:
+        _CYBERDROP_DIR_FLAG = "--download-folder"
+    return _CYBERDROP_DIR_FLAG
+
+
+def resolve_signed_media_item(
+    item_url: str,
+    cookies: str = "",
+    user_agent: str = ""
+) -> Optional[Dict[str, str]]:
+    if not is_ssrf_safe_url(item_url):
+        return None
+
+    ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    headers = {
+        "User-Agent": ua,
+        "Referer": item_url
+    }
+    if cookies:
+        headers["Cookie"] = cookies
+
+    page_html = ""
+    try:
+        from curl_cffi import requests as cffi_requests
+        resp = cffi_requests.get(item_url, headers=headers, impersonate="chrome", timeout=20)
+        if resp.status_code == 200:
+            page_html = resp.text
+    except Exception:
+        page_html = ""
+
+    if not page_html:
+        try:
+            req = urllib.request.Request(item_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=20) as u_resp:
+                if u_resp.status == 200:
+                    page_html = u_resp.read().decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+    if not page_html:
+        return None
+
+    body_low = page_html[:8000].lower()
+    if "unavailable for maintenance" in body_low or "maintenance is in progress" in body_low:
+        return None
+
+    m_cdn = re.search(r'jsCDN\s*=\s*"([^"]+)"', page_html)
+    m_sign = re.search(r'signUrl\s*=\s*"([^"]+)"', page_html)
+
+    if not m_cdn or not m_sign:
+        return None
+
+    js_cdn = m_cdn.group(1).replace(r"\/", "/")
+    sign_url = m_sign.group(1).replace(r"\/", "/")
+
+    parsed_sign = urllib.parse.urlparse(sign_url)
+    if parsed_sign.scheme != "https" or not is_ssrf_safe_url(sign_url):
+        return None
+
+    sign_host = (parsed_sign.hostname or "").lower()
+    if not any(sign_host == h or sign_host.endswith(f".{h}") for h in ALLOWED_SIGN_HOSTS):
+        return None
+
+    parsed_cdn = urllib.parse.urlparse(js_cdn)
+    if not is_ssrf_safe_url(js_cdn):
+        return None
+
+    cdn_path = parsed_cdn.path
+    sign_req_url = f"{sign_url}?path={urllib.parse.quote(cdn_path)}"
+    if not is_ssrf_safe_url(sign_req_url):
+        return None
+
+    sign_json: Dict[str, Any] = {}
+    try:
+        from curl_cffi import requests as cffi_requests
+        s_resp = cffi_requests.get(sign_req_url, headers=headers, impersonate="chrome", timeout=20)
+        if s_resp.status_code == 200:
+            sign_json = s_resp.json()
+    except Exception:
+        sign_json = {}
+
+    if not sign_json:
+        try:
+            req_sign = urllib.request.Request(sign_req_url, headers=headers)
+            with urllib.request.urlopen(req_sign, timeout=20) as s_resp2:
+                if s_resp2.status == 200:
+                    sign_json = json.loads(s_resp2.read().decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+
+    token = sign_json.get("token")
+    ex = sign_json.get("ex")
+    if not token or not ex:
+        return None
+
+    q_dict = dict(urllib.parse.parse_qsl(parsed_cdn.query))
+    q_dict["token"] = str(token)
+    q_dict["ex"] = str(ex)
+    final_query = urllib.parse.urlencode(q_dict)
+    direct_cdn_url = urllib.parse.urlunparse((
+        parsed_cdn.scheme,
+        parsed_cdn.netloc,
+        parsed_cdn.path,
+        parsed_cdn.params,
+        final_query,
+        parsed_cdn.fragment
+    ))
+
+    extracted_name = ""
+    m_h1 = re.search(r'<h1[^>]*>([^<]+)</h1>', page_html, re.IGNORECASE)
+    if m_h1:
+        extracted_name = m_h1.group(1).strip()
+    if not extracted_name:
+        m_title = re.search(r'<title[^>]*>([^<]+)</title>', page_html, re.IGNORECASE)
+        if m_title:
+            extracted_name = m_title.group(1).strip()
+    if not extracted_name:
+        extracted_name = os.path.basename(parsed_cdn.path)
+
+    return {
+        "url": direct_cdn_url,
+        "filename": extracted_name,
+        "referer": item_url
+    }
+
+
+def download_direct_with_aria2_or_curl(
+    url: str,
+    job_dir: str,
+    preferred_name: str,
+    job_id: str,
+    referer: Optional[str] = None,
+    cookies: Optional[str] = None,
+    user_agent: Optional[str] = None
+) -> bool:
+    valid_exts = (
+        ".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts",
+        ".zip", ".rar", ".7z", ".tar", ".gz",
+        ".jpg", ".jpeg", ".png", ".webp", ".gif",
+        ".mp3", ".m4a", ".flac", ".wav",
+        ".pdf", ".txt", ".json", ".csv"
+    )
+    parsed = urllib.parse.urlparse(url)
+    cdn_fn = os.path.basename(parsed.path or "")
+    cdn_ext = os.path.splitext(cdn_fn)[1].lower()
+
+    target_fn = ""
+    if preferred_name:
+        sanitized_pref = sanitize_filename(preferred_name)
+        if any(sanitized_pref.lower().endswith(ext) for ext in valid_exts):
+            target_fn = sanitized_pref
+        elif cdn_ext in valid_exts:
+            target_fn = f"{sanitized_pref}{cdn_ext}"
+        else:
+            target_fn = sanitized_pref
+
+    if not target_fn or not any(target_fn.lower().endswith(ext) for ext in valid_exts):
+        if cdn_fn and any(cdn_fn.lower().endswith(ext) for ext in valid_exts):
+            target_fn = sanitize_filename(cdn_fn)
+        else:
+            target_fn = f"media_{job_id[:8]}.mp4"
+
+    ua = user_agent or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+    aria2_bin = shutil.which("aria2c")
+    if aria2_bin:
+        cmd = [
+            aria2_bin,
+            "-x", "16",
+            "-s", "16",
+            "-k", "1M",
+            "--disable-ipv6=true",
+            "--max-tries=5",
+            "--retry-wait=2",
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--file-allocation=none",
+            "--connect-timeout=20",
+            "--timeout=30",
+            "--show-console-readout=true",
+            "--summary-interval=1",
+            "--dir", job_dir,
+            "--out", target_fn,
+            f"--user-agent={ua}"
+        ]
+        if referer:
+            cmd.append(f"--header=Referer: {referer}")
+        if cookies:
+            cmd.append(f"--header=Cookie: {cookies}")
+        cmd.append(url)
+
+        ret, stderr_text = run_process_with_heartbeat(cmd, job_id, "Downloading directly via aria2c...", timeout_sec=1200)
+        target_path = pathlib.Path(job_dir) / target_fn
+        if ret == 0 and target_path.is_file() and target_path.stat().st_size > 50 * 1024:
+            return True
+
+    target_path = pathlib.Path(job_dir) / target_fn
+    headers = {"User-Agent": ua}
+    if referer:
+        headers["Referer"] = referer
+    if cookies:
+        headers["Cookie"] = cookies
+
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            if resp.status == 200:
+                tot_len = int(resp.headers.get("Content-Length", "0"))
+                cd_header = resp.headers.get("Content-Disposition", "")
+                if "filename=" in cd_header:
+                    m_fn = re.search(r'filename=["\']?([^"\';\r\n]+)', cd_header)
+                    if m_fn:
+                        cd_fn = sanitize_filename(m_fn.group(1).strip())
+                        if any(cd_fn.lower().endswith(ext) for ext in valid_exts):
+                            target_fn = cd_fn
+                            target_path = pathlib.Path(job_dir) / target_fn
+
+                dl_bytes = 0
+                last_active = time.monotonic()
+                last_hb = time.monotonic()
+                with open(target_path, "wb") as out_f:
+                    while True:
+                        chunk = resp.read(64 * 1024)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+                        dl_bytes += len(chunk)
+                        last_active = time.monotonic()
+                        if last_active - last_hb >= 1.5:
+                            last_hb = last_active
+                            dl_pct = (dl_bytes / tot_len * 100.0) if tot_len > 0 else 0.0
+                            call_api(f"/internal/update/{job_id}", {
+                                "progress": min(50.0, dl_pct * 0.5),
+                                "downloaded_bytes": dl_bytes,
+                                "total_bytes": tot_len,
+                                "phase_detail": "Downloading"
+                            })
+                        if time.monotonic() - last_active > 25:
+                            raise TimeoutError("Stall watchdog triggered in streaming download")
+                if target_path.is_file() and target_path.stat().st_size > 50 * 1024:
+                    return True
+    except Exception:
+        pass
+
+    return False
+
+
+def is_valid_upload_candidate(
+    file_path: pathlib.Path,
+    plugin: str,
+    expected_is_direct_doc: bool
+) -> Tuple[bool, str]:
+    if not file_path.is_file():
+        return False, "Not a file"
+
+    suffix_low = file_path.suffix.lower()
+
+    forbidden_suffixes = {
+        ".unknown_video", ".html", ".htm", ".xhtml", ".part",
+        ".ytdl", ".tmp", ".log", ".db", ".sqlite", ".sqlite3",
+        ".ini", ".cfg", ".yaml", ".yml"
+    }
+    if suffix_low in forbidden_suffixes:
+        return False, f"Forbidden file extension: {suffix_low}"
+
+    if not expected_is_direct_doc:
+        doc_suffixes = {".txt", ".json", ".xml", ".csv"}
+        if suffix_low in doc_suffixes:
+            return False, f"Unexpected metadata/text file in media download: {suffix_low}"
+
+    size = file_path.stat().st_size
+    if size == 0:
+        return False, "Zero-byte file"
+
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(512).strip().lower()
+            if (
+                header.startswith(b"<!doc")
+                or header.startswith(b"<html")
+                or header.startswith(b"<head")
+                or header.startswith(b"<script")
+                or header.startswith(b"<?xml")
+                or header.startswith(b'{"error')
+            ):
+                return False, "File content is HTML/XML/JSON error page instead of media"
+    except Exception as e:
+        return False, f"Could not inspect file header: {e}"
+
+    video_exts = {".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts", ".avi", ".flv"}
+    if suffix_low in video_exts or not expected_is_direct_doc:
+        if size < 50 * 1024:
+            return False, f"File size too small ({size} bytes < 50 KB minimum)"
+
+    return True, ""
+
+
+def valid_upload_candidates(
+    job_dir: str,
+    plugin: str,
+    expected_is_direct_doc: bool
+) -> List[pathlib.Path]:
+    candidates = []
+    for f in pathlib.Path(job_dir).rglob("*"):
+        if f.is_file():
+            ok, _ = is_valid_upload_candidate(f, plugin, expected_is_direct_doc)
+            if ok:
+                candidates.append(f)
+    return candidates
+
+
 def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) -> None:
     global _CURRENT_SUBPROC
     job_id = job["job_id"]
@@ -1186,22 +1612,79 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
         })
 
         safe_name = sanitize_filename(filename or title)
-        out_tmpl = f"{safe_name}.%(ext)s" if safe_name else "%(title)s.%(ext)s"
+        safe_stem = _strip_media_ext(safe_name).replace("%", "%%")
+        out_tmpl = f"{safe_stem}.%(ext)s" if safe_stem else "%(title)s.%(ext)s"
 
         success = False
         stderr_text = ""
 
-        # Community plugin execution (cyberdrop-dl or gallery-dl)
-        if plugin == "cyberdrop-dl" or (plugin in ("webpage_crawl", "bunkr_album", "direct") and is_cyberdrop_supported_host(raw_url)):
-            cyberdrop_bin = shutil.which("cyberdrop-dl") or str(pathlib.Path(sys.executable).parent / "cyberdrop-dl")
-            cd_cmd = [cyberdrop_bin, "-o", job_dir, raw_url]
-            ret, stderr_text = run_process_with_heartbeat(cd_cmd, job_id, "Downloading via cyberdrop-dl...", timeout_sec=900)
-            if "429" in stderr_text or "Too Many Requests" in stderr_text:
-                report_host_cooldown(root_host, 60, "Rate limited (429)")
-            cd_files = [f for f in pathlib.Path(job_dir).rglob("*") if f.is_file()]
-            if ret == 0 and cd_files:
-                success = True
-            success = (ret == 0)
+        expected_is_direct_doc = (plugin == "direct") and (
+            urllib.parse.urlparse(raw_url).path.lower().endswith(
+                (".pdf", ".txt", ".json", ".csv", ".doc", ".docx", ".xls", ".xlsx", ".epub")
+            )
+        )
+
+        is_crawled_item = plugin in ("webpage_crawl", "tube_grid", "ytdlp_playlist", "browser_batch")
+
+        # 1. Cyberlocker / multi-file host lane
+        if plugin == "cyberdrop-dl" or is_cyberdrop_supported_host(raw_url):
+            parsed_raw = urllib.parse.urlparse(raw_url)
+            is_item_page = any(parsed_raw.path.startswith(prefix) for prefix in ("/f/", "/v/"))
+
+            # Step 1: Signed-media item page direct resolution
+            if is_item_page:
+                log_state(job_id, "resolving_signed_media")
+                call_api(f"/internal/update/{job_id}", {
+                    "phase_detail": "Resolving signed CDN direct media..."
+                })
+                resolved = resolve_signed_media_item(raw_url, cookies=cookies or "", user_agent=user_agent or "")
+                if resolved and resolved.get("url"):
+                    direct_url = resolved["url"]
+                    pref_name = resolved.get("filename") or safe_name
+                    success = download_direct_with_aria2_or_curl(
+                        direct_url, job_dir, pref_name, job_id,
+                        referer=resolved.get("referer") or raw_url,
+                        cookies=cookies, user_agent=user_agent
+                    )
+
+            # Step 2: Cyberdrop-dl invocation
+            if not success:
+                cyberdrop_bin = shutil.which("cyberdrop-dl") or str(pathlib.Path(sys.executable).parent / "cyberdrop-dl")
+                dir_flag = _detect_cyberdrop_dir_flag(cyberdrop_bin)
+                cd_cmd = [cyberdrop_bin, dir_flag, job_dir, raw_url]
+                ret, stderr_text = run_process_with_heartbeat(cd_cmd, job_id, "Downloading via cyberdrop-dl...", timeout_sec=900)
+                if "429" in stderr_text or "Too Many Requests" in stderr_text:
+                    report_host_cooldown(root_host, 60, "Rate limited (429)")
+                if ret == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
+                    success = True
+
+            # Step 3: Playwright fallback for cyberlocker
+            if not success:
+                log_state(job_id, "resolving_stream")
+                call_api(f"/internal/update/{job_id}", {
+                    "phase_detail": "Resolving stream via headless browser..."
+                })
+                pw_stream = resolve_with_playwright([raw_url], raw_url, cookies or "", user_agent or "")
+                if pw_stream and pw_stream.get("url"):
+                    stream_url = pw_stream["url"]
+                    pw_ref = pw_stream.get("referer") or raw_url
+                    pw_cook = pw_stream.get("cookies") or cookies
+                    pw_ua = pw_stream.get("user_agent") or user_agent
+                    success = download_direct_with_aria2_or_curl(
+                        stream_url, job_dir, safe_name, job_id,
+                        referer=pw_ref, cookies=pw_cook, user_agent=pw_ua
+                    )
+                    if not success:
+                        cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook, use_aria2=True)
+                        ret_pw, stderr_pw = run_process_with_heartbeat(cmd_pw, job_id, "Downloading resolved stream...", timeout_sec=900)
+                        if ret_pw == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
+                            success = True
+                        else:
+                            stderr_text += f"\n{stderr_pw}"
+
+            # Step 4: Strict Lane Separation - NEVER fall through to generic yt-dlp on cyberlocker item pages!
+            if not success:
+                raise RuntimeError("Could not resolve downloadable media from host page")
 
         elif plugin == "gallery-dl":
             gallery_dl_bin = shutil.which("gallery-dl") or str(pathlib.Path(sys.executable).parent / "gallery-dl")
@@ -1209,55 +1692,98 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             ret, stderr_text = run_process_with_heartbeat(g_cmd, job_id, "Downloading via gallery-dl...", timeout_sec=900)
             if "429" in stderr_text or "Too Many Requests" in stderr_text:
                 report_host_cooldown(root_host, 60, "Rate limited (429)")
-            success = (ret == 0)
+            if ret == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
+                success = True
 
-        if not success:
-            # yt-dlp download with socket timeout and stall watchdog
-            cmd = build_ytdlp_cmd(raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies)
+        else:
+            # Generic yt-dlp lane (with aria2 and single-connection retry guard)
+            cmd = build_ytdlp_cmd(raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies, use_aria2=True)
             ret, stderr_text = run_process_with_heartbeat(cmd, job_id, "Downloading via yt-dlp...", timeout_sec=1200)
 
-            # Detect rate limiting / 429
+            # Single-connection retry guard: If aria2c was used and exited non-zero, retry once with use_aria2=False
+            if ret != 0 and "--downloader" in cmd:
+                log_state(job_id, "retry_single_connection")
+                call_api(f"/internal/update/{job_id}", {
+                    "phase_detail": "Retrying with standard progressive connection..."
+                })
+                cmd_single = build_ytdlp_cmd(raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies, use_aria2=False)
+                ret, stderr_text = run_process_with_heartbeat(cmd_single, job_id, "Downloading via yt-dlp (single connection)...", timeout_sec=1200)
+
             if "429" in stderr_text or "Too Many Requests" in stderr_text:
                 report_host_cooldown(root_host, 60, "Rate limited (429)")
 
-            success = (ret == 0)
+            if ret == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
+                success = True
 
-            # Fast Fallback on CDN 401/403/404/410/stall to page_url extractor
-            if not success and page_url and page_url != raw_url:
-                log_state(job_id, "page_fallback")
-                call_api(f"/internal/update/{job_id}", {
-                    "phase_detail": "CDN stalled — resolving via page extractor..."
-                })
-                cmd_fallback = build_ytdlp_cmd(page_url, job_dir, out_tmpl, target_height, user_agent, page_url, cookies)
-                cmd_fallback.extend(["--impersonate", "chrome"])
-                ret_fb, stderr_fb = run_process_with_heartbeat(cmd_fallback, job_id, "Downloading via page extractor...", timeout_sec=900)
-                if ret_fb == 0:
-                    success = True
-                else:
-                    stderr_text += f"\n{stderr_fb}"
+            # Fallback handling for crawled item vs sniffed CDN
+            if not success:
+                if is_crawled_item:
+                    # Crawled item: raw_url is the actual item watch page
+                    log_state(job_id, "item_impersonate_fallback")
+                    call_api(f"/internal/update/{job_id}", {
+                        "phase_detail": "Resolving crawled item with browser impersonation..."
+                    })
+                    cmd_impersonate = build_ytdlp_cmd(
+                        raw_url, job_dir, out_tmpl, target_height, None, referer, cookies,
+                        use_aria2=True, impersonate="chrome"
+                    )
+                    ret_imp, stderr_imp = run_process_with_heartbeat(cmd_impersonate, job_id, "Downloading item via browser impersonation...", timeout_sec=900)
+                    if ret_imp == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
+                        success = True
+                    else:
+                        stderr_text += f"\n{stderr_imp}"
+                elif page_url and page_url != raw_url:
+                    # Sniffed CDN: page_url is the watch page
+                    log_state(job_id, "page_fallback")
+                    call_api(f"/internal/update/{job_id}", {
+                        "phase_detail": "CDN stalled — resolving via page extractor..."
+                    })
+                    cmd_fallback = build_ytdlp_cmd(
+                        page_url, job_dir, out_tmpl, target_height, None, page_url, cookies,
+                        use_aria2=True, impersonate="chrome"
+                    )
+                    ret_fb, stderr_fb = run_process_with_heartbeat(cmd_fallback, job_id, "Downloading via page extractor...", timeout_sec=900)
+                    if ret_fb == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
+                        success = True
+                    else:
+                        stderr_text += f"\n{stderr_fb}"
 
-            # Playwright fallback if stream failed
+            # Playwright fallback if still not succeeded
             if not success:
                 log_state(job_id, "resolving_stream")
                 call_api(f"/internal/update/{job_id}", {
                     "phase_detail": "Resolving stream via headless browser..."
                 })
-                candidates = [u for u in [referer, page_url, raw_url] if u]
-                pw_stream = resolve_with_playwright(candidates, page_url or raw_url, cookies or "", user_agent or "")
+                if is_crawled_item:
+                    candidates = [raw_url]
+                    pw_nav_target = raw_url
+                else:
+                    candidates = [u for u in [page_url, referer, raw_url] if u]
+                    pw_nav_target = page_url or raw_url
+
+                pw_stream = resolve_with_playwright(candidates, pw_nav_target, cookies or "", user_agent or "")
                 if pw_stream and pw_stream.get("url"):
                     stream_url = pw_stream["url"]
                     pw_ref = pw_stream.get("referer") or referer
                     pw_cook = pw_stream.get("cookies") or cookies
                     pw_ua = pw_stream.get("user_agent") or user_agent
-                    cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook)
+                    cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook, use_aria2=True)
                     ret_pw, stderr_pw = run_process_with_heartbeat(cmd_pw, job_id, "Downloading resolved stream...", timeout_sec=900)
-                    if ret_pw == 0:
+                    if ret_pw == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
                         success = True
                     else:
                         stderr_text += f"\n{stderr_pw}"
 
-        downloaded_files = [f for f in pathlib.Path(job_dir).rglob("*") if f.is_file()]
+        downloaded_files = valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)
         if not success or not downloaded_files:
+            all_files = [f for f in pathlib.Path(job_dir).rglob("*") if f.is_file()]
+            rejection_reasons = []
+            for f in all_files:
+                ok, reason = is_valid_upload_candidate(f, plugin, expected_is_direct_doc)
+                if not ok:
+                    rejection_reasons.append(f"{f.name}: {reason}")
+            if rejection_reasons:
+                raise RuntimeError(f"Rejected invalid download candidates: {'; '.join(rejection_reasons[:3])}")
             err_msg = stderr_text[-400:] if stderr_text else "Download failed"
             raise RuntimeError(sanitize_text(err_msg))
 
@@ -1279,7 +1805,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                 for ext_f in extracted_files:
                     ef_path = ext_f
                     ef_name = os.path.basename(ext_f)
-                    if ef_path.lower().endswith((".mp4", ".mkv", ".webm")):
+                    if ef_path.lower().endswith((".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts")):
                         ef_path = rebuild_video(ef_path)
                     fsize = os.path.getsize(ef_path)
                     call_api(f"/internal/update/{job_id}", {
@@ -1299,7 +1825,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                 return
 
         # Rebuild & Verify Video
-        if target_file.suffix.lower() in (".mp4", ".mkv", ".webm", ".ts"):
+        if target_file.suffix.lower() in (".mp4", ".mkv", ".webm", ".mov", ".m4v", ".ts"):
             log_state(job_id, "rebuilding")
             call_api(f"/internal/update/{job_id}", {
                 "phase_detail": "Rebuilding seekable MP4..."
@@ -1320,12 +1846,11 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
         })
 
         def on_upload_prog(pct, uploaded_b, tot_b, speed_text=""):
-            ul_pct = (uploaded_b / max(1, tot_b)) * 100.0
             payload: Dict[str, Any] = {
                 "progress": pct,
                 "downloaded_bytes": uploaded_b,
                 "total_bytes": tot_b,
-                "phase_detail": f"Uploading to Drive ({ul_pct:.0f}%)"
+                "phase_detail": "Uploading to Drive"
             }
             if speed_text:
                 payload["speed_text"] = speed_text

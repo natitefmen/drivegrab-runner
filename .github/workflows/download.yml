@@ -22,10 +22,15 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Ensure 7z and ffmpeg
+      - name: Ensure 7z, ffmpeg, and aria2
         run: |
           set +x
-          which 7z >/dev/null 2>&1 || which 7za >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full)
+          NEED_APT=""
+          command -v 7z >/dev/null 2>&1 || command -v 7za >/dev/null 2>&1 || NEED_APT="$NEED_APT p7zip-full"
+          command -v aria2c >/dev/null 2>&1 || NEED_APT="$NEED_APT aria2"
+          if [ -n "$NEED_APT" ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq $NEED_APT
+          fi
 
       - name: Compute Monthly Cache Key
         id: meta
