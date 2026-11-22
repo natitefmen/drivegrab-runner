@@ -10,7 +10,9 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 42
+    permissions:
+      contents: read
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -20,6 +22,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Ensure 7z and ffmpeg
+        run: |
+          set +x
+          which 7z >/dev/null 2>&1 || which 7za >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full)
+
       - name: Compute Monthly Cache Key
         id: meta
         run: echo "month=$(date +%Y-%m)" >> $GITHUB_OUTPUT
@@ -28,16 +35,16 @@ jobs:
         uses: actions/cache@v4
         id: venv-cache
         with:
-          path: ~/.venv
-          key: dg-venv-u2404-${{ steps.meta.outputs.month }}-v53
+          path: ~/.cache/drivegrab-venv
+          key: dg-venv-u2404-${{ steps.meta.outputs.month }}-v60
 
       - name: Install Dependencies
         if: steps.venv-cache.outputs.cache-hit != 'true'
         run: |
           set +x
-          python -m venv ~/.venv
-          ~/.venv/bin/pip install --upgrade pip -qq
-          ~/.venv/bin/pip install -r requirements.txt -qq
+          python -m venv ~/.cache/drivegrab-venv
+          ~/.cache/drivegrab-venv/bin/pip install --upgrade pip -qq
+          ~/.cache/drivegrab-venv/bin/pip install -r requirements.txt -qq
 
       - name: Execute Silent Media Sync
         env:
@@ -50,7 +57,7 @@ jobs:
           PLAYWRIGHT_CHROME_PATH: /usr/bin/google-chrome
         run: |
           set +x
-          ~/.venv/bin/python scripts/gh_worker.py
+          ~/.cache/drivegrab-venv/bin/python scripts/gh_worker.py
 
       - name: Cleanup
         if: always()

@@ -124,6 +124,20 @@ def is_ssrf_safe_url(url_str: str) -> bool:
         return False
 
 
+def extract_root_host(url_str: str) -> str:
+    try:
+        host = urllib.parse.urlparse(url_str).hostname.lower()
+        parts = host.split('.')
+        if len(parts) <= 2:
+            return host
+        two_part_tlds = {'co', 'com', 'org', 'net', 'gov', 'edu'}
+        if parts[-2] in two_part_tlds and len(parts) >= 3:
+            return f"{parts[-3]}.{parts[-2]}.{parts[-1]}"
+        return f"{parts[-2]}.{parts[-1]}"
+    except Exception:
+        return "unknown"
+
+
 def sanitize_filename(name: str, max_len: int = 120) -> str:
     if not name:
         return ""
@@ -136,22 +150,14 @@ def sanitize_filename(name: str, max_len: int = 120) -> str:
     return clean
 
 
-def is_generic_title(name: str) -> bool:
-    if not name:
-        return True
-    s = name.strip().lower()
-    if not s:
-        return True
-    generic_words = {
-        "master", "index", "playlist", "hls", "video", "stream",
-        "media", "chunklist", "manifest", "audio", "output"
-    }
-    base = s.rsplit(".", 1)[0]
-    if base in generic_words:
-        return True
-    if re.match(r'^(index|hls|master|video|stream)[-_].*', base):
-        return True
-    return False
+def format_size(bytes_val: int) -> str:
+    if bytes_val <= 0:
+        return ""
+    if bytes_val < 1024 * 1024:
+        return f"{(bytes_val / 1024):.1f} KB"
+    if bytes_val < 1024 * 1024 * 1024:
+        return f"{(bytes_val / (1024 * 1024)):.1f} MB"
+    return f"{(bytes_val / (1024 * 1024 * 1024)):.2f} GB"
 
 
 def call_api(endpoint: str, data: Optional[dict] = None) -> dict:
@@ -187,12 +193,23 @@ def call_api(endpoint: str, data: Optional[dict] = None) -> dict:
                 raise
         time.sleep(1.5 * attempt)
 
-    # Check for cooperative control signal
+    # Cooperative control signal check
     control = res_data.get("control", "")
     if control in ("pause", "stop", "deleted"):
         raise ControlAbort(control)
 
     return res_data
+
+
+def report_host_cooldown(host: str, seconds: int = 60, reason: str = "") -> None:
+    try:
+        call_api("/internal/host_cooldown", {
+            "host": host,
+            "seconds": seconds,
+            "reason": reason
+        })
+    except Exception:
+        pass
 
 
 class GoogleDriveUploader:
@@ -265,7 +282,7 @@ class GoogleDriveUploader:
                     time.sleep(delay)
                     continue
                 raise RuntimeError(f"Google Drive initiate session error {he.code}: {err_body[:200]}")
-            except Exception as e:
+            except Exception:
                 if attempt < 8:
                     delay = min(90.0, (2 ** attempt) * 2.5) + random.uniform(0.5, 2.5)
                     time.sleep(delay)
@@ -320,7 +337,7 @@ class GoogleDriveUploader:
                                 offset += chunk_len
                             chunk_uploaded = True
                             break
-                        
+
                         err_body = he.read().decode("utf-8", errors="replace")
                         if is_drive_retryable_error(he.code, err_body) and attempt < 8:
                             retry_after = he.headers.get("Retry-After")
@@ -328,14 +345,14 @@ class GoogleDriveUploader:
                                 delay = min(90.0, float(retry_after))
                             else:
                                 delay = min(90.0, (2 ** attempt) * 2.5) + random.uniform(0.5, 2.5)
-                            
+
                             call_api(f"/internal/update/{job_id}", {
                                 "phase_detail": f"Drive quota backoff ({int(delay)}s)..."
                             })
                             log_state(job_id, "retry_backoff", f"DRIVE_{he.code}")
                             time.sleep(delay)
 
-                            # Probe session offset with empty Content-Range
+                            # Probe session offset
                             probe_req = urllib.request.Request(
                                 session_url,
                                 data=b"",
@@ -375,7 +392,7 @@ class GoogleDriveUploader:
                         raise
 
                 now = time.monotonic()
-                if now - last_report >= 2.0:
+                if now - last_report >= 1.5:
                     last_report = now
                     pct = min(99.0, 50.0 + (offset / file_size * 50.0))
                     if on_progress:
@@ -463,97 +480,273 @@ def verify_video_integrity(file_path: str) -> bool:
         return False
 
 
-def resolve_with_playwright(candidate_urls: List[str], page_url: Optional[str], cookies: Optional[str], user_agent: Optional[str]) -> Optional[Dict[str, Any]]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return None
+def build_ytdlp_cmd(
+    target_url: str,
+    job_dir: str,
+    out_tmpl: str,
+    target_height: int = 1080,
+    user_agent: Optional[str] = None,
+    referer: Optional[str] = None,
+    cookies: Optional[str] = None
+) -> List[str]:
+    format_spec = f"bv*[height<={target_height}][ext=mp4]+ba[ext=m4a]/b[height<={target_height}][ext=mp4]/bv*[height<={target_height}]+ba/b[height<={target_height}]/best"
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "-f", format_spec,
+        "--no-playlist",
+        "--socket-timeout", "25",
+        "--force-ipv4",
+        "--abort-on-unavailable-fragments",
+        "--concurrent-fragments", "8",
+        "--merge-output-format", "mp4",
+        "-P", job_dir,
+        "-o", out_tmpl,
+    ]
+    if user_agent:
+        cmd.extend(["--user-agent", user_agent])
+    if referer:
+        cmd.extend(["--add-header", f"Referer:{referer}"])
+    if cookies:
+        cmd.extend(["--add-header", f"Cookie:{cookies}"])
+    cmd.extend(["--", target_url])
+    return cmd
 
-    valid = [u for u in candidate_urls if u and is_ssrf_safe_url(u)]
-    if not valid:
-        return None
 
-    to_visit = valid[:2]
-    captured_streams: List[Dict[str, Any]] = []
+def run_process_with_heartbeat(
+    cmd: List[str],
+    job_id: str,
+    phase_detail: str,
+    timeout_sec: float = 1200.0,
+    heartbeat_interval: float = 1.5
+) -> Tuple[int, str]:
+    global _CURRENT_SUBPROC
+    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    _CURRENT_SUBPROC = proc
+    last_hb = time.monotonic()
+    start_time = time.monotonic()
 
-    try:
-        with sync_playwright() as p:
-            custom_exec = os.getenv("PLAYWRIGHT_CHROME_PATH")
-            launch_kwargs: Dict[str, Any] = {
-                "headless": True,
-                "args": ["--no-sandbox", "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"]
-            }
-            if custom_exec and os.path.exists(custom_exec):
-                launch_kwargs["executable_path"] = custom_exec
+    while proc.poll() is None:
+        time.sleep(0.3)
+        now = time.monotonic()
+        if now - start_time > timeout_sec:
+            proc.kill()
+            _CURRENT_SUBPROC = None
+            raise RuntimeError(f"Process timed out after {timeout_sec}s")
 
-            browser = p.chromium.launch(**launch_kwargs)
-            try:
-                desktop_ua = user_agent or "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                context = browser.new_context(user_agent=desktop_ua, viewport={"width": 1280, "height": 720})
+        if now - last_hb >= heartbeat_interval:
+            last_hb = now
+            call_api(f"/internal/update/{job_id}", {
+                "phase_detail": phase_detail
+            })
 
-                if cookies and page_url and page_url.startswith(("http://", "https://")):
-                    try:
-                        cookie_list = []
-                        for pair in cookies.split(";"):
-                            if "=" in pair:
-                                k, v = pair.split("=", 1)
-                                k_s, v_s = k.strip(), v.strip()
-                                if k_s:
-                                    cookie_list.append({"name": k_s, "value": v_s, "url": page_url})
-                        if cookie_list:
-                            context.add_cookies(cookie_list)
-                    except Exception:
-                        pass
+    _CURRENT_SUBPROC = None
+    stderr_text = proc.stderr.read() if proc.stderr else ""
+    return proc.returncode, stderr_text
 
-                def on_response(response):
-                    try:
-                        u = response.url
-                        u_low = u.lower()
-                        if response.status in (200, 206) and any(ext in u_low for ext in (".m3u8", ".mpd", ".mp4")):
-                            if is_ssrf_safe_url(u):
-                                captured_streams.append({
-                                    "url": u,
-                                    "status": response.status,
-                                    "referer": response.request.headers.get("referer"),
-                                    "user_agent": response.request.headers.get("user-agent")
-                                })
-                    except Exception:
-                        pass
 
-                context.on("response", on_response)
-                page = context.new_page()
+def extract_archive_zipslip_safe(
+    archive_path: str,
+    extracted_dir: str,
+    passwords: Optional[List[str]] = None,
+    skip_junk: bool = True
+) -> List[str]:
+    """Extract archive using 7z with strict Zip-Slip and symlink defense."""
+    os.makedirs(extracted_dir, exist_ok=True)
+    seven_z = shutil.which("7z") or shutil.which("7za") or "7z"
 
-                start = time.monotonic()
-                for target in to_visit:
-                    if time.monotonic() - start > 20.0 or captured_streams:
-                        break
-                    try:
-                        page.goto(target, wait_until="domcontentloaded", timeout=15000)
-                    except Exception:
+    all_passwords = [""] + (passwords or [])
+    success = False
+
+    for pw in all_passwords:
+        cmd = [seven_z, "x", "-y", f"-o{extracted_dir}"]
+        if pw:
+            cmd.append(f"-p{pw}")
+        else:
+            cmd.append("-p")
+        cmd.append(archive_path)
+
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0:
+            success = True
+            break
+
+    if not success:
+        raise RuntimeError("Archive extraction failed (unsupported format or password required)")
+
+    # Zip-Slip and Symlink Defense
+    extracted_root = pathlib.Path(extracted_dir).resolve()
+    valid_files: List[str] = []
+
+    junk_extensions = {".nfo", ".url", ".txt", ".sfv", ".diz", ".db"}
+    junk_names = {"thumbs.db", ".ds_store"}
+
+    for p in list(pathlib.Path(extracted_dir).rglob("*")):
+        try:
+            # Reject symlinks unconditionally
+            if p.is_symlink():
+                p.unlink(missing_ok=True)
+                continue
+
+            # Zip-Slip directory traversal check
+            resolved = p.resolve()
+            if not str(resolved).startswith(str(extracted_root)):
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+                elif p.is_dir():
+                    shutil.rmtree(str(p), ignore_errors=True)
+                continue
+
+            if p.is_file():
+                # Junk filter
+                if skip_junk:
+                    ext = p.suffix.lower()
+                    name = p.name.lower()
+                    if ext in junk_extensions or name in junk_names or "__MACOSX" in str(p):
+                        p.unlink(missing_ok=True)
                         continue
+                valid_files.append(str(p))
+        except Exception:
+            pass
 
-                    for selector in ("video", '[class*="play"]', 'button[aria-label*="Play"]'):
+    return valid_files
+
+
+def execute_linkgrabber_analyze(job: Dict[str, Any]) -> None:
+    job_id = job["job_id"]
+    log_state(job_id, "analyzing")
+    call_api(f"/internal/update/{job_id}", {
+        "status": "downloading",
+        "phase_detail": "Analyzing links with cloud plugins..."
+    })
+
+    payload_str = job.get("batch_payload", "{}")
+    payload = json.loads(payload_str) if payload_str else {}
+    staged_id = payload.get("staged_id") or job_id
+    urls = payload.get("urls") or [job.get("url")]
+    page_url = payload.get("page_url") or job.get("page_url")
+    cookies = payload.get("cookies")
+    user_agent = payload.get("user_agent")
+    deep_analyze = payload.get("deep_analyze", False)
+
+    first_url = urls[0] if urls else (page_url or "")
+    root_host = extract_root_host(first_url)
+    items: List[Dict[str, Any]] = []
+    plugin_used = "direct"
+    detected_title = f"{root_host} Album"
+
+    for u in urls[:40]:
+        if not u or not is_ssrf_safe_url(u):
+            continue
+
+        u_low = u.lower()
+        # Playlist or Video platform
+        if any(v in u_low for v in ("youtube.com", "youtu.be", "vimeo.com", "tiktok.com", "x.com", "twitter.com", "tnaflix.com", "spankbang.com", "pornhub.com")):
+            plugin_used = "yt-dlp"
+            cmd = [
+                sys.executable, "-m", "yt_dlp",
+                "--flat-playlist",
+                "--dump-single-json",
+                "--socket-timeout", "20",
+                "--playlist-end", "40",
+            ]
+            if user_agent:
+                cmd.extend(["--user-agent", user_agent])
+            if cookies:
+                cmd.extend(["--add-header", f"Cookie:{cookies}"])
+            cmd.extend(["--", u])
+
+            try:
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                if res.returncode == 0 and res.stdout:
+                    info = json.loads(res.stdout)
+                    detected_title = info.get("title") or detected_title
+                    entries = info.get("entries") or [info]
+                    for idx, e in enumerate(entries):
+                        if not e:
+                            continue
+                        e_url = e.get("url") or e.get("webpage_url") or u
+                        if not e_url.startswith("http"):
+                            e_url = f"https://www.youtube.com/watch?v={e_url}"
+                        items.append({
+                            "url": e_url,
+                            "title": e.get("title") or f"Video {idx + 1}",
+                            "filename": f"{sanitize_filename(e.get('title') or f'Video_{idx + 1}')}.mp4",
+                            "size_bytes": e.get("filesize") or e.get("filesize_approx") or 0,
+                            "size_text": format_size(e.get("filesize") or e.get("filesize_approx") or 0),
+                            "file_type": "video",
+                            "availability": "online",
+                            "item_kind": "watch_page",
+                            "duration_text": str(e.get("duration") or ""),
+                        })
+                    continue
+            except Exception:
+                pass
+
+        # Cyberdrop / Gallery / File host
+        cyberdrop_bin = shutil.which("cyberdrop-dl") or str(pathlib.Path(sys.executable).parent / "cyberdrop-dl")
+        gallery_dl_bin = shutil.which("gallery-dl") or str(pathlib.Path(sys.executable).parent / "gallery-dl")
+
+        if os.path.exists(gallery_dl_bin) and any(g in u_low for g in ("kemono", "coomer", "e-hentai", "danbooru", "imgbox")):
+            plugin_used = "gallery-dl"
+            g_cmd = [gallery_dl_bin, "--dump-json", "--range", "1-60", u]
+            try:
+                g_res = subprocess.run(g_cmd, capture_output=True, text=True, timeout=35)
+                if g_res.returncode == 0 and g_res.stdout:
+                    for line in g_res.stdout.splitlines():
+                        if not line.strip():
+                            continue
                         try:
-                            el = page.query_selector(selector)
-                            if el and el.is_visible():
-                                el.click(timeout=1500)
-                                break
+                            g_data = json.loads(line)
+                            if isinstance(g_data, list) and len(g_data) >= 2:
+                                g_url = g_data[1]
+                                g_meta = g_data[2] if len(g_data) >= 3 else {}
+                                fn = g_meta.get("filename") or g_url.split("/")[-1].split("?")[0]
+                                items.append({
+                                    "url": g_url,
+                                    "title": fn,
+                                    "filename": fn,
+                                    "size_bytes": 0,
+                                    "size_text": "",
+                                    "file_type": "image",
+                                    "availability": "online",
+                                    "item_kind": "direct_file",
+                                    "duration_text": "",
+                                })
                         except Exception:
                             pass
+                    if items:
+                        continue
+            except Exception:
+                pass
 
-                    for _ in range(8):
-                        if captured_streams:
-                            break
-                        time.sleep(0.5)
+        # Direct file fallback
+        raw_name = u.split("/")[-1].split("?")[0] or "file"
+        ft = "video" if raw_name.lower().endswith((".mp4", ".mkv", ".webm")) else ("archive" if raw_name.lower().endswith((".zip", ".rar", ".7z")) else "other")
+        items.append({
+            "url": u,
+            "title": raw_name,
+            "filename": raw_name,
+            "size_bytes": 0,
+            "size_text": "",
+            "file_type": ft,
+            "availability": "online",
+            "item_kind": "direct_file",
+            "duration_text": "",
+        })
 
-            finally:
-                browser.close()
-    except Exception:
-        pass
+    # Post structured results to Cloudflare Edge
+    call_api(f"/internal/linkgrabber_result/{staged_id}", {
+        "title": detected_title,
+        "plugin": plugin_used,
+        "source_host": root_host,
+        "items": items,
+    })
 
-    if captured_streams:
-        return captured_streams[0]
-    return None
+    log_state(job_id, "analyzed", f"count={len(items)}")
+    call_api(f"/internal/update/{job_id}", {
+        "status": "completed",
+        "phase_detail": f"Analysis complete ({len(items)} items discovered)"
+    })
 
 
 def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) -> None:
@@ -567,7 +760,11 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
     referer = job.get("referer")
     cookies = job.get("cookies")
     page_url = job.get("page_url")
+    plugin = job.get("plugin", "direct")
+    auto_extract = job.get("auto_extract", 0) == 1
+    target_height = job.get("target_height") or 1080
 
+    root_host = extract_root_host(raw_url)
     job_dir = f"/tmp/drivegrab/{job_id}"
     os.makedirs(job_dir, exist_ok=True)
 
@@ -575,90 +772,121 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
         log_state(job_id, "downloading")
         call_api(f"/internal/update/{job_id}", {
             "status": "downloading",
-            "phase_detail": "Downloading via runner"
+            "phase_detail": "Connecting to CDN..."
         })
 
         safe_name = sanitize_filename(filename or title)
         out_tmpl = f"{safe_name}.%(ext)s" if safe_name else "%(title)s.%(ext)s"
 
-        cmd = [
-            sys.executable, "-m", "yt_dlp",
-            "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-            "--no-playlist",
-            "--concurrent-fragments", "8",
-            "--merge-output-format", "mp4",
-            "-P", job_dir,
-            "-o", out_tmpl,
-        ]
-        if user_agent:
-            cmd.extend(["--user-agent", user_agent])
-        if referer:
-            cmd.extend(["--add-header", f"Referer:{referer}"])
-        if cookies:
-            cmd.extend(["--add-header", f"Cookie:{cookies}"])
-        cmd.extend(["--", raw_url])
+        success = False
+        stderr_text = ""
 
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        _CURRENT_SUBPROC = proc
-        last_hb = time.monotonic()
-        while proc.poll() is None:
-            time.sleep(0.5)
-            now = time.monotonic()
-            if now - last_hb >= 2.0:
-                last_hb = now
+        # Community plugin execution (cyberdrop-dl or gallery-dl)
+        if plugin == "cyberdrop-dl":
+            cyberdrop_bin = shutil.which("cyberdrop-dl") or str(pathlib.Path(sys.executable).parent / "cyberdrop-dl")
+            cd_cmd = [cyberdrop_bin, "-o", job_dir, raw_url]
+            ret, stderr_text = run_process_with_heartbeat(cd_cmd, job_id, "Downloading via cyberdrop-dl...", timeout_sec=900)
+            if "429" in stderr_text or "Too Many Requests" in stderr_text:
+                report_host_cooldown(root_host, 60, "Rate limited (429)")
+            success = (ret == 0)
+
+        elif plugin == "gallery-dl":
+            gallery_dl_bin = shutil.which("gallery-dl") or str(pathlib.Path(sys.executable).parent / "gallery-dl")
+            g_cmd = [gallery_dl_bin, "-d", job_dir, raw_url]
+            ret, stderr_text = run_process_with_heartbeat(g_cmd, job_id, "Downloading via gallery-dl...", timeout_sec=900)
+            if "429" in stderr_text or "Too Many Requests" in stderr_text:
+                report_host_cooldown(root_host, 60, "Rate limited (429)")
+            success = (ret == 0)
+
+        else:
+            # yt-dlp download with socket timeout and stall watchdog
+            cmd = build_ytdlp_cmd(raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies)
+            ret, stderr_text = run_process_with_heartbeat(cmd, job_id, "Downloading via yt-dlp...", timeout_sec=1200)
+
+            # Detect rate limiting / 429
+            if "429" in stderr_text or "Too Many Requests" in stderr_text:
+                report_host_cooldown(root_host, 60, "Rate limited (429)")
+
+            success = (ret == 0)
+
+            # Fast Fallback on CDN 401/403/404/410/stall to page_url extractor
+            if not success and page_url and page_url != raw_url:
+                log_state(job_id, "page_fallback")
                 call_api(f"/internal/update/{job_id}", {
-                    "status": "downloading",
-                    "phase_detail": "Downloading via runner"
+                    "phase_detail": "CDN stalled — resolving via page extractor..."
                 })
-        _CURRENT_SUBPROC = None
-        stderr_text = proc.stderr.read() if proc.stderr else ""
-        success = (proc.returncode == 0)
+                cmd_fallback = build_ytdlp_cmd(page_url, job_dir, out_tmpl, target_height, user_agent, page_url, cookies)
+                cmd_fallback.extend(["--impersonate", "chrome"])
+                ret_fb, stderr_fb = run_process_with_heartbeat(cmd_fallback, job_id, "Downloading via page extractor...", timeout_sec=900)
+                if ret_fb == 0:
+                    success = True
+                else:
+                    stderr_text += f"\n{stderr_fb}"
 
-        # Fallback to Playwright if stream resolution failed
-        if not success:
-            log_state(job_id, "resolving_stream")
-            pw_stream = resolve_with_playwright([referer, page_url, raw_url], page_url, cookies, user_agent)
-            if pw_stream and pw_stream.get("url"):
-                stream_url = pw_stream["url"]
-                cmd_pw = [
-                    sys.executable, "-m", "yt_dlp",
-                    "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
-                    "--no-playlist",
-                    "-P", job_dir,
-                    "-o", out_tmpl,
-                    "--", stream_url
-                ]
-                proc_pw = subprocess.Popen(cmd_pw, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-                _CURRENT_SUBPROC = proc_pw
-                last_hb = time.monotonic()
-                while proc_pw.poll() is None:
-                    time.sleep(0.5)
-                    now = time.monotonic()
-                    if now - last_hb >= 2.0:
-                        last_hb = now
-                        call_api(f"/internal/update/{job_id}", {
-                            "status": "downloading",
-                            "phase_detail": "Downloading via runner"
-                        })
-                _CURRENT_SUBPROC = None
-                stderr_text = proc_pw.stderr.read() if proc_pw.stderr else ""
-                success = (proc_pw.returncode == 0)
-
-        if not success:
-            err_msg = stderr_text[-400:] if stderr_text else "Download failed"
-            raise RuntimeError(sanitize_text(err_msg))
+            # Playwright fallback if stream failed
+            if not success:
+                log_state(job_id, "resolving_stream")
+                call_api(f"/internal/update/{job_id}", {
+                    "phase_detail": "Resolving stream via headless browser..."
+                })
+                pw_stream = resolve_with_playwright([referer, page_url, raw_url], page_url, cookies, user_agent)
+                if pw_stream and pw_stream.get("url"):
+                    stream_url = pw_stream["url"]
+                    cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies)
+                    ret_pw, stderr_pw = run_process_with_heartbeat(cmd_pw, job_id, "Downloading resolved stream...", timeout_sec=900)
+                    if ret_pw == 0:
+                        success = True
+                    else:
+                        stderr_text += f"\n{stderr_pw}"
 
         downloaded_files = [f for f in pathlib.Path(job_dir).rglob("*") if f.is_file()]
-        if not downloaded_files:
-            raise RuntimeError("No files downloaded by yt-dlp")
+        if not success or not downloaded_files:
+            err_msg = stderr_text[-400:] if stderr_text else "Download failed"
+            raise RuntimeError(sanitize_text(err_msg))
 
         target_file = max(downloaded_files, key=lambda f: f.stat().st_size)
         file_path = str(target_file)
         final_fn = target_file.name
 
-        # Rebuild & Verify
+        # Auto-extract archives if enabled
+        is_archive = target_file.suffix.lower() in (".zip", ".rar", ".7z", ".001") or ".part1.rar" in final_fn.lower()
+        if auto_extract and is_archive:
+            log_state(job_id, "extracting")
+            call_api(f"/internal/update/{job_id}", {
+                "phase_detail": "Extracting archive in cloud..."
+            })
+            extracted_dir = os.path.join(job_dir, "extracted")
+            extracted_files = extract_archive_zipslip_safe(file_path, extracted_dir, skip_junk=True)
+
+            if extracted_files:
+                for ext_f in extracted_files:
+                    ef_path = ext_f
+                    ef_name = os.path.basename(ext_f)
+                    if ef_path.lower().endswith((".mp4", ".mkv", ".webm")):
+                        ef_path = rebuild_video(ef_path)
+                    fsize = os.path.getsize(ef_path)
+                    call_api(f"/internal/update/{job_id}", {
+                        "status": "uploading_to_gdrive",
+                        "filename": ef_name,
+                        "total_bytes": fsize,
+                        "phase_detail": f"Uploading extracted file ({format_size(fsize)})..."
+                    })
+                    uploader.upload_file(ef_path, ef_name, folder_id, job_id)
+
+                log_state(job_id, "completed")
+                call_api(f"/internal/update/{job_id}", {
+                    "status": "completed",
+                    "progress": 100.0,
+                    "phase_detail": f"Extracted and saved {len(extracted_files)} files to Drive"
+                })
+                return
+
+        # Rebuild & Verify Video
         if target_file.suffix.lower() in (".mp4", ".mkv", ".webm", ".ts"):
             log_state(job_id, "rebuilding")
+            call_api(f"/internal/update/{job_id}", {
+                "phase_detail": "Rebuilding seekable MP4..."
+            })
             file_path = rebuild_video(file_path)
             log_state(job_id, "verifying")
             if not verify_video_integrity(file_path):
@@ -671,7 +899,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             "status": "uploading_to_gdrive",
             "filename": final_fn,
             "total_bytes": fsize,
-            "phase_detail": "Uploading to Google Drive (128 MiB chunks)"
+            "phase_detail": "Uploading to Google Drive (128 MiB chunks)..."
         })
 
         def on_upload_prog(pct, uploaded_b, tot_b):
@@ -724,7 +952,6 @@ def execute_batch_direct(job: Dict[str, Any], uploader: GoogleDriveUploader) -> 
 
     try:
         for idx, item in enumerate(items):
-            # Check control signal before each item
             call_api(f"/internal/update/{job_id}", {
                 "status": "downloading",
                 "phase_detail": f"Processing item {idx+1}/{total}"
@@ -741,16 +968,13 @@ def execute_batch_direct(job: Dict[str, Any], uploader: GoogleDriveUploader) -> 
                 log_state(job_id, f"item_{idx+1}_of_{total}")
                 dest_path = os.path.join(job_dir, safe_fn)
 
-                curl_cmd = ["curl", "-sSL", "-o", dest_path, item_url]
+                curl_cmd = ["curl", "-sSL", "--connect-timeout", "15", "--max-time", "1200", "-o", dest_path, item_url]
                 if item.get("extra_cookie"):
                     curl_cmd.extend(["-H", f"Cookie: {item['extra_cookie']}"])
 
-                proc = subprocess.Popen(curl_cmd)
-                _CURRENT_SUBPROC = proc
-                proc.wait(timeout=1200)
-                _CURRENT_SUBPROC = None
+                ret, _ = run_process_with_heartbeat(curl_cmd, job_id, f"Downloading item {idx+1}/{total}...", timeout_sec=1200)
 
-                if os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024:
+                if ret == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024:
                     if dest_path.lower().endswith((".mp4", ".mkv", ".webm")):
                         dest_path = rebuild_video(dest_path)
                     uploader.upload_file(dest_path, safe_fn, folder_id, job_id)
@@ -785,6 +1009,16 @@ def execute_batch_direct(job: Dict[str, Any], uploader: GoogleDriveUploader) -> 
         raise
 
 
+def dispatch_job(job: Dict[str, Any], uploader: GoogleDriveUploader) -> None:
+    mode = job.get("job_mode", "single")
+    if mode == "linkgrabber_analyze":
+        execute_linkgrabber_analyze(job)
+    elif mode == "batch_direct":
+        execute_batch_direct(job, uploader)
+    else:
+        execute_single_download(job, uploader)
+
+
 def main():
     if not JOB_ID or not WORKER_URL or not API_SECRET:
         sys.stderr.write("Missing mandatory environment variables\n")
@@ -794,7 +1028,6 @@ def main():
     log_state(JOB_ID, "booting")
 
     try:
-        # Claim initial job with pre-start abort guard
         try:
             job = call_api(f"/internal/claim/{JOB_ID}")
         except ControlAbort:
@@ -810,13 +1043,9 @@ def main():
             sys.exit(0)
 
         log_state(JOB_ID, "claimed")
-        mode = job.get("job_mode", "single")
 
         try:
-            if mode == "batch_direct":
-                execute_batch_direct(job, uploader)
-            else:
-                execute_single_download(job, uploader)
+            dispatch_job(job, uploader)
         except ControlAbort as ca:
             log_state(JOB_ID, ca.signal)
             abort_active_resources()
@@ -830,7 +1059,6 @@ def main():
             if elapsed >= 2280:  # 38 minutes max runner runtime
                 break
 
-            # Check if another queued job is waiting (0s boot delay chaining!)
             try:
                 next_job = call_api("/internal/claim_next")
             except ControlAbort:
@@ -841,12 +1069,8 @@ def main():
             if next_job and next_job.get("job_id"):
                 next_id = next_job["job_id"]
                 log_state(next_id, "warm_claimed")
-                next_mode = next_job.get("job_mode", "single")
                 try:
-                    if next_mode == "batch_direct":
-                        execute_batch_direct(next_job, uploader)
-                    else:
-                        execute_single_download(next_job, uploader)
+                    dispatch_job(next_job, uploader)
                 except ControlAbort as ca:
                     log_state(next_id, ca.signal)
                     abort_active_resources()
@@ -874,7 +1098,6 @@ def main():
         shutil.rmtree(f"/tmp/drivegrab/{JOB_ID}", ignore_errors=True)
         sys.exit(1)
     finally:
-        # Goodbye notification to Edge so warm timer resets immediately
         try:
             req = urllib.request.Request(
                 f"{WORKER_URL}/internal/runner_goodbye",
