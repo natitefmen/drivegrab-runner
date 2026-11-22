@@ -13,6 +13,8 @@ import shutil
 import pathlib
 import mimetypes
 import random
+import threading
+import collections
 from typing import Optional, List, Dict, Any, Tuple
 
 # Configuration
@@ -24,7 +26,7 @@ GDRIVE_CLIENT_ID = os.environ.get("GDRIVE_CLIENT_ID", "").strip()
 GDRIVE_CLIENT_SECRET = os.environ.get("GDRIVE_CLIENT_SECRET", "").strip()
 GDRIVE_REFRESH_TOKEN = os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()
 
-CHUNK_SIZE = 128 * 1024 * 1024  # 128 MiB (134,217,728 bytes, exact multiple of 256 KiB)
+CHUNK_SIZE = 32 * 1024 * 1024  # 32 MiB (33,554,432 bytes, exact multiple of 256 KiB)
 RUNNER_START_TIME = time.monotonic()
 
 _CURRENT_SUBPROC: Optional[subprocess.Popen] = None
@@ -120,6 +122,25 @@ def is_ssrf_safe_url(url_str: str) -> bool:
             if not ip_obj.is_global or ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
                 return False
         return True
+    except Exception:
+        return False
+
+
+def validate_public_url(url_str: str) -> bool:
+    return is_ssrf_safe_url(url_str)
+
+
+def is_cyberdrop_supported_host(url: str) -> bool:
+    if not url:
+        return False
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        patterns = (
+            "bunkr.", "bunkrr.", "cyberdrop.", "gofile.io", "pixeldrain.com",
+            "saint.", "saint2.", "coomer.", "kemono.", "mediafire.com",
+            "mega.nz", "jpg5.", "simpcity."
+        )
+        return any(p in host for p in patterns)
     except Exception:
         return False
 
@@ -316,6 +337,7 @@ class GoogleDriveUploader:
                 }
 
                 chunk_uploaded = False
+                chunk_start = time.monotonic()
                 for attempt in range(1, 9):
                     req = urllib.request.Request(session_url, data=chunk_data, headers=headers, method="PUT")
                     try:
@@ -391,12 +413,22 @@ class GoogleDriveUploader:
                             continue
                         raise
 
+                chunk_elapsed = max(0.001, time.monotonic() - chunk_start)
+                speed_bps = chunk_len / chunk_elapsed
+                if speed_bps >= 1024 * 1024:
+                    speed_text = f"{(speed_bps / (1024 * 1024)):.1f} MB/s"
+                else:
+                    speed_text = f"{(speed_bps / 1024):.0f} KB/s"
+
                 now = time.monotonic()
-                if now - last_report >= 1.5:
+                if (now - last_report >= 1.0) or (offset >= file_size):
                     last_report = now
-                    pct = min(99.0, 50.0 + (offset / file_size * 50.0))
+                    pct = min(99.0, 50.0 + (offset / file_size * 49.0))
                     if on_progress:
-                        on_progress(pct, offset, file_size)
+                        try:
+                            on_progress(pct, offset, file_size, speed_text)
+                        except TypeError:
+                            on_progress(pct, offset, file_size)
 
         _CURRENT_SESSION_URL = None
         return {}
@@ -480,6 +512,73 @@ def verify_video_integrity(file_path: str) -> bool:
         return False
 
 
+def parse_dg_progress_line(line: str) -> Optional[Dict[str, Any]]:
+    if not line:
+        return None
+    line_clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', line).strip()
+    if "DG_PROG|" in line_clean:
+        idx = line_clean.find("DG_PROG|")
+        rest = line_clean[idx + len("DG_PROG|"):]
+        parts = rest.split("|")
+        if len(parts) >= 7:
+            pct_str, dl_b_str, tot_b_str, tot_est_str, frag_idx_str, frag_cnt_str, spd_str = [p.strip() for p in parts[:7]]
+
+            dl_bytes = int(dl_b_str) if dl_b_str.isdigit() else 0
+            tot_bytes = int(tot_b_str) if tot_b_str.isdigit() else (int(tot_est_str) if tot_est_str.isdigit() else 0)
+
+            dl_pct = 0.0
+            pct_clean = pct_str.replace("%", "").strip()
+            try:
+                dl_pct = float(pct_clean)
+            except ValueError:
+                if dl_bytes > 0 and tot_bytes > 0:
+                    dl_pct = (dl_bytes / tot_bytes) * 100.0
+                elif frag_idx_str.isdigit() and frag_cnt_str.isdigit() and int(frag_cnt_str) > 0:
+                    dl_pct = (int(frag_idx_str) / int(frag_cnt_str)) * 100.0
+
+            speed_text = ""
+            if spd_str and spd_str.upper() not in ("NA", "UNKNOWN", "N/A"):
+                m_spd = re.search(r'([\d\.]+)\s*([KMG]i?B)/s', spd_str, re.IGNORECASE)
+                if m_spd:
+                    val = m_spd.group(1)
+                    unit = m_spd.group(2).upper().replace("I", "")
+                    speed_text = f"{val} {unit}/s"
+                else:
+                    speed_text = spd_str.replace("MiB/s", " MB/s").replace("KiB/s", " KB/s").replace("GiB/s", " GB/s").strip()
+
+            return {
+                "dl_pct": min(100.0, max(0.0, dl_pct)),
+                "downloaded_bytes": dl_bytes,
+                "total_bytes": tot_bytes,
+                "speed_text": speed_text
+            }
+
+    m = re.search(r'\[download\]\s+([\d\.]+)%\s+of\s+~?([\d\.]+\s*[KMG]i?B)(?:\s+at\s+([\d\.]+\s*[KMG]i?B/s))?', line_clean)
+    if m:
+        try:
+            dl_pct = float(m.group(1))
+            spd = m.group(3) or ""
+            speed_text = ""
+            if spd:
+                m_spd = re.search(r'([\d\.]+)\s*([KMG]i?B)/s', spd, re.IGNORECASE)
+                if m_spd:
+                    val = m_spd.group(1)
+                    unit = m_spd.group(2).upper().replace("I", "")
+                    speed_text = f"{val} {unit}/s"
+                else:
+                    speed_text = spd.replace("MiB/s", " MB/s").replace("KiB/s", " KB/s").replace("GiB/s", " GB/s").strip()
+            return {
+                "dl_pct": min(100.0, max(0.0, dl_pct)),
+                "downloaded_bytes": 0,
+                "total_bytes": 0,
+                "speed_text": speed_text
+            }
+        except Exception:
+            pass
+
+    return None
+
+
 def build_ytdlp_cmd(
     target_url: str,
     job_dir: str,
@@ -497,7 +596,11 @@ def build_ytdlp_cmd(
         "--socket-timeout", "25",
         "--force-ipv4",
         "--abort-on-unavailable-fragments",
-        "--concurrent-fragments", "8",
+        "--concurrent-fragments", "24",
+        "--fragment-retries", "15",
+        "--retries", "15",
+        "--newline",
+        "--progress-template", "download:DG_PROG|%(progress._percent_str)s|%(progress.downloaded_bytes)s|%(progress.total_bytes)s|%(progress.total_bytes_estimate)s|%(progress.fragment_index)s|%(progress.fragment_count)s|%(progress._speed_str)s",
         "--merge-output-format", "mp4",
         "-P", job_dir,
         "-o", out_tmpl,
@@ -520,27 +623,88 @@ def run_process_with_heartbeat(
     heartbeat_interval: float = 1.5
 ) -> Tuple[int, str]:
     global _CURRENT_SUBPROC
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        bufsize=1
+    )
     _CURRENT_SUBPROC = proc
+
+    tail_lines: collections.deque = collections.deque(maxlen=40)
+    latest_prog: Dict[str, Any] = {}
+    prog_lock = threading.Lock()
+
+    def reader():
+        try:
+            if proc.stdout:
+                for line in proc.stdout:
+                    line_str = line.strip()
+                    if not line_str:
+                        continue
+                    tail_lines.append(line_str)
+                    prog = parse_dg_progress_line(line_str)
+                    if prog:
+                        with prog_lock:
+                            latest_prog.update(prog)
+        except Exception:
+            pass
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+
     last_hb = time.monotonic()
     start_time = time.monotonic()
 
-    while proc.poll() is None:
-        time.sleep(0.3)
-        now = time.monotonic()
-        if now - start_time > timeout_sec:
-            proc.kill()
-            _CURRENT_SUBPROC = None
-            raise RuntimeError(f"Process timed out after {timeout_sec}s")
+    try:
+        while proc.poll() is None:
+            time.sleep(0.3)
+            now = time.monotonic()
+            if now - start_time > timeout_sec:
+                proc.kill()
+                _CURRENT_SUBPROC = None
+                raise RuntimeError(f"Process timed out after {timeout_sec}s")
 
-        if now - last_hb >= heartbeat_interval:
-            last_hb = now
-            call_api(f"/internal/update/{job_id}", {
-                "phase_detail": phase_detail
-            })
+            if now - last_hb >= heartbeat_interval:
+                last_hb = now
+                with prog_lock:
+                    cur_prog = dict(latest_prog)
 
-    _CURRENT_SUBPROC = None
-    stderr_text = proc.stderr.read() if proc.stderr else ""
+                dl_pct = cur_prog.get("dl_pct", 0.0)
+                overall_prog = min(50.0, dl_pct * 0.5)
+
+                update_payload: Dict[str, Any] = {
+                    "progress": overall_prog,
+                    "phase_detail": f"Downloading ({dl_pct:.0f}%)" if dl_pct > 0 else phase_detail
+                }
+                if cur_prog.get("downloaded_bytes"):
+                    update_payload["downloaded_bytes"] = cur_prog["downloaded_bytes"]
+                if cur_prog.get("total_bytes"):
+                    update_payload["total_bytes"] = cur_prog["total_bytes"]
+                if cur_prog.get("speed_text"):
+                    update_payload["speed_text"] = cur_prog["speed_text"]
+
+                call_api(f"/internal/update/{job_id}", update_payload)
+
+    except ControlAbort:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        _CURRENT_SUBPROC = None
+        raise
+    finally:
+        _CURRENT_SUBPROC = None
+
+    t.join(timeout=2.0)
+    stderr_text = "\n".join(tail_lines)
     return proc.returncode, stderr_text
 
 
@@ -609,6 +773,252 @@ def extract_archive_zipslip_safe(
             pass
 
     return valid_files
+
+
+def resolve_with_playwright(
+    candidate_urls: List[str],
+    page_url: str,
+    cookies: str = "",
+    user_agent: str = ""
+) -> Optional[Dict[str, str]]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return None
+
+    valid_urls: List[str] = []
+    seen = set()
+    for u in (candidate_urls or []):
+        if not u or not isinstance(u, str):
+            continue
+        u_clean = u.strip()
+        if u_clean and u_clean not in seen and is_ssrf_safe_url(u_clean):
+            seen.add(u_clean)
+            valid_urls.append(u_clean)
+
+    if not valid_urls:
+        return None
+
+    pw_instance = None
+    browser = None
+    context = None
+    try:
+        pw_instance = sync_playwright().start()
+        chrome_path = os.getenv("PLAYWRIGHT_CHROME_PATH")
+        if chrome_path and not os.path.exists(chrome_path):
+            chrome_path = None
+
+        launch_kwargs: Dict[str, Any] = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage", "--autoplay-policy=no-user-gesture-required"]
+        }
+        if chrome_path:
+            launch_kwargs["executable_path"] = chrome_path
+
+        browser = pw_instance.chromium.launch(**launch_kwargs)
+
+        ua = (
+            user_agent
+            if (user_agent and "Mozilla" in user_agent and "Mobile" not in user_agent)
+            else "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+        context = browser.new_context(
+            user_agent=ua,
+            viewport={"width": 1280, "height": 720},
+            java_script_enabled=True
+        )
+
+        if cookies and page_url and is_ssrf_safe_url(page_url):
+            cookie_list = []
+            for part in cookies.split(";"):
+                if "=" in part:
+                    k, v = part.strip().split("=", 1)
+                    if k.strip():
+                        cookie_list.append({
+                            "name": k.strip(),
+                            "value": v.strip(),
+                            "url": page_url
+                        })
+            if cookie_list:
+                try:
+                    context.add_cookies(cookie_list)
+                except Exception:
+                    pass
+
+        ad_hosts = (
+            "doubleclick", "googlesyndication", "exoclick", "juicyads",
+            "tsyndicate", "trafficjunky", "adtng", "popads", "adsterra",
+            "popcash", "propellerads", "hilltopads", "clickadu", "monetag", "admaven"
+        )
+        dns_cache: Dict[str, bool] = {}
+
+        def handle_route(route):
+            try:
+                r_url = route.request.url
+                p = urllib.parse.urlparse(r_url)
+                if p.scheme not in ("http", "https"):
+                    route.abort()
+                    return
+                h = (p.hostname or "").lower()
+                if any(ad in h for ad in ad_hosts):
+                    route.abort()
+                    return
+                if route.request.resource_type in ("image", "font"):
+                    route.abort()
+                    return
+                path_low = p.path.lower()
+                if any(path_low.endswith(ext) for ext in (".ts", ".m4s", ".cmfv", ".cmfa")):
+                    route.abort()
+                    return
+                if h not in dns_cache:
+                    dns_cache[h] = is_ssrf_safe_url(r_url)
+                if not dns_cache[h]:
+                    route.abort()
+                    return
+                route.continue_()
+            except Exception:
+                try:
+                    route.abort()
+                except Exception:
+                    pass
+
+        context.route("**/*", handle_route)
+
+        found_streams: List[Dict[str, Any]] = []
+
+        def check_stream(u_target: str, status: Optional[int], headers: Optional[Dict[str, str]]):
+            if not u_target:
+                return
+            t_low = u_target.lower()
+            is_master = "master.m3u8" in t_low
+            is_hls = ".m3u8" in t_low
+            is_dash = ".mpd" in t_low
+            ct = (headers.get("content-type") if headers else "") or ""
+            ct_low = ct.lower()
+            is_mp4 = ".mp4" in t_low or "video/mp4" in ct_low
+            is_webm = ".webm" in t_low or "video/webm" in ct_low
+
+            if is_master or is_hls or is_dash or is_mp4 or is_webm:
+                if is_master and status in (200, 206):
+                    prio = 0
+                elif is_hls and status in (200, 206):
+                    prio = 1
+                elif is_hls:
+                    prio = 2
+                elif is_dash and status in (200, 206):
+                    prio = 3
+                elif is_dash:
+                    prio = 4
+                elif (is_mp4 or is_webm) and status in (200, 206):
+                    prio = 5
+                else:
+                    prio = 6
+
+                found_streams.append({
+                    "url": u_target,
+                    "prio": prio,
+                    "status": status,
+                    "headers": headers or {}
+                })
+
+        def on_response(resp):
+            try:
+                check_stream(resp.url, resp.status, resp.headers)
+            except Exception:
+                pass
+
+        def on_request(req):
+            try:
+                check_stream(req.url, None, req.headers)
+            except Exception:
+                pass
+
+        context.on("response", on_response)
+        context.on("request", on_request)
+
+        page = context.new_page()
+        start_time = time.monotonic()
+
+        for cand_url in valid_urls[:2]:
+            if time.monotonic() - start_time >= 30.0:
+                break
+            try:
+                page.goto(cand_url, wait_until="domcontentloaded", timeout=20000)
+            except Exception:
+                pass
+
+            wait_until_t = min(start_time + 32.0, time.monotonic() + 4.0)
+            while time.monotonic() < wait_until_t:
+                if any(s["prio"] <= 1 for s in found_streams):
+                    break
+                time.sleep(0.5)
+
+            if not any(s["prio"] <= 5 for s in found_streams) and time.monotonic() - start_time < 28.0:
+                for sel in ("video", '[class*="play"]', 'button[aria-label*="Play"]'):
+                    try:
+                        loc = page.locator(sel).first
+                        if loc.is_visible(timeout=1000):
+                            loc.click(timeout=1500)
+                            break
+                    except Exception:
+                        pass
+                wait_until_click = min(start_time + 34.0, time.monotonic() + 6.0)
+                while time.monotonic() < wait_until_click:
+                    if any(s["prio"] <= 1 for s in found_streams):
+                        break
+                    time.sleep(0.5)
+
+            if found_streams:
+                break
+
+        if not found_streams:
+            return None
+
+        found_streams.sort(key=lambda x: (x["prio"], -(1 if x["status"] in (200, 206) else 0)))
+        best = found_streams[0]
+        stream_url = best["url"]
+
+        captured_cookies = ""
+        try:
+            c_objs = context.cookies(stream_url)
+            captured_cookies = "; ".join(f"{c['name']}={c['value']}" for c in c_objs if 'name' in c and 'value' in c)
+        except Exception:
+            pass
+
+        ref = page.url or page_url
+        orig = ""
+        try:
+            p_ref = urllib.parse.urlparse(ref)
+            orig = f"{p_ref.scheme}://{p_ref.netloc}"
+        except Exception:
+            pass
+
+        return {
+            "url": stream_url,
+            "referer": ref,
+            "origin": orig,
+            "user_agent": ua,
+            "cookies": captured_cookies
+        }
+
+    except Exception:
+        return None
+    finally:
+        if context:
+            try:
+                context.close()
+            except Exception:
+                pass
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if pw_instance:
+            try:
+                pw_instance.stop()
+            except Exception:
+                pass
 
 
 def execute_linkgrabber_analyze(job: Dict[str, Any]) -> None:
@@ -782,12 +1192,15 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
         stderr_text = ""
 
         # Community plugin execution (cyberdrop-dl or gallery-dl)
-        if plugin == "cyberdrop-dl":
+        if plugin == "cyberdrop-dl" or (plugin in ("webpage_crawl", "bunkr_album", "direct") and is_cyberdrop_supported_host(raw_url)):
             cyberdrop_bin = shutil.which("cyberdrop-dl") or str(pathlib.Path(sys.executable).parent / "cyberdrop-dl")
             cd_cmd = [cyberdrop_bin, "-o", job_dir, raw_url]
             ret, stderr_text = run_process_with_heartbeat(cd_cmd, job_id, "Downloading via cyberdrop-dl...", timeout_sec=900)
             if "429" in stderr_text or "Too Many Requests" in stderr_text:
                 report_host_cooldown(root_host, 60, "Rate limited (429)")
+            cd_files = [f for f in pathlib.Path(job_dir).rglob("*") if f.is_file()]
+            if ret == 0 and cd_files:
+                success = True
             success = (ret == 0)
 
         elif plugin == "gallery-dl":
@@ -798,7 +1211,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                 report_host_cooldown(root_host, 60, "Rate limited (429)")
             success = (ret == 0)
 
-        else:
+        if not success:
             # yt-dlp download with socket timeout and stall watchdog
             cmd = build_ytdlp_cmd(raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies)
             ret, stderr_text = run_process_with_heartbeat(cmd, job_id, "Downloading via yt-dlp...", timeout_sec=1200)
@@ -829,10 +1242,14 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                 call_api(f"/internal/update/{job_id}", {
                     "phase_detail": "Resolving stream via headless browser..."
                 })
-                pw_stream = resolve_with_playwright([referer, page_url, raw_url], page_url, cookies, user_agent)
+                candidates = [u for u in [referer, page_url, raw_url] if u]
+                pw_stream = resolve_with_playwright(candidates, page_url or raw_url, cookies or "", user_agent or "")
                 if pw_stream and pw_stream.get("url"):
                     stream_url = pw_stream["url"]
-                    cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies)
+                    pw_ref = pw_stream.get("referer") or referer
+                    pw_cook = pw_stream.get("cookies") or cookies
+                    pw_ua = pw_stream.get("user_agent") or user_agent
+                    cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook)
                     ret_pw, stderr_pw = run_process_with_heartbeat(cmd_pw, job_id, "Downloading resolved stream...", timeout_sec=900)
                     if ret_pw == 0:
                         success = True
@@ -899,15 +1316,20 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             "status": "uploading_to_gdrive",
             "filename": final_fn,
             "total_bytes": fsize,
-            "phase_detail": "Uploading to Google Drive (128 MiB chunks)..."
+            "phase_detail": "Uploading to Google Drive (32 MiB chunks)..."
         })
 
-        def on_upload_prog(pct, uploaded_b, tot_b):
-            call_api(f"/internal/update/{job_id}", {
+        def on_upload_prog(pct, uploaded_b, tot_b, speed_text=""):
+            ul_pct = (uploaded_b / max(1, tot_b)) * 100.0
+            payload: Dict[str, Any] = {
                 "progress": pct,
                 "downloaded_bytes": uploaded_b,
-                "phase_detail": f"Uploading to Drive ({(uploaded_b / (1024*1024)):.1f} / {(tot_b / (1024*1024)):.1f} MB)"
-            })
+                "total_bytes": tot_b,
+                "phase_detail": f"Uploading to Drive ({ul_pct:.0f}%)"
+            }
+            if speed_text:
+                payload["speed_text"] = speed_text
+            call_api(f"/internal/update/{job_id}", payload)
 
         res = uploader.upload_file(file_path, final_fn, folder_id, job_id, on_progress=on_upload_prog)
         if not res or not res.get("id"):
