@@ -424,7 +424,7 @@ class GoogleDriveUploader:
                 now = time.monotonic()
                 if (now - last_report >= 1.0) or (offset >= file_size):
                     last_report = now
-                    pct = min(99.0, 50.0 + (offset / file_size * 49.0))
+                    pct = min(99.0, (offset / max(1, file_size)) * 100.0)
                     if on_progress:
                         try:
                             on_progress(pct, offset, file_size, speed_text)
@@ -624,6 +624,23 @@ def parse_dg_progress_line(line: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clear_job_dir(job_dir: str) -> None:
+    """Removes all files and subdirectories inside job_dir while preserving job_dir itself."""
+    if not os.path.exists(job_dir):
+        os.makedirs(job_dir, exist_ok=True)
+        return
+    for item in os.listdir(job_dir):
+        item_path = os.path.join(job_dir, item)
+        try:
+            if os.path.isdir(item_path) and not os.path.islink(item_path):
+                shutil.rmtree(item_path, ignore_errors=True)
+            else:
+                os.remove(item_path)
+        except Exception:
+            pass
+    os.makedirs(job_dir, exist_ok=True)
+
+
 def build_ytdlp_cmd(
     target_url: str,
     job_dir: str,
@@ -634,6 +651,7 @@ def build_ytdlp_cmd(
     cookies: Optional[str] = None,
     use_aria2: bool = True,
     impersonate: Optional[str] = None,
+    aria2_conns: int = 16,
 ) -> List[str]:
     format_spec = f"bv*[height<={target_height}][ext=mp4]+ba[ext=m4a]/b[height<={target_height}][ext=mp4]/bv*[height<={target_height}]+ba/b[height<={target_height}]/best"
     cmd = [
@@ -663,10 +681,12 @@ def build_ytdlp_cmd(
         or "/get_file/" in parsed_path
     )
 
-    if use_aria2 and not is_manifest and not is_tokenized_php and shutil.which("aria2c"):
+    if use_aria2 and aria2_conns > 1 and not is_manifest and not is_tokenized_php and shutil.which("aria2c"):
+        conns = str(max(2, min(16, int(aria2_conns))))
         cmd.extend([
-            "--downloader", "http,https:aria2c",
-            "--downloader-args", "aria2c:-x 16 -s 16 -k 1M --disable-ipv6=true --file-allocation=none --connect-timeout=20 --timeout=30 --max-tries=5 --retry-wait=2 --show-console-readout=true --summary-interval=1"
+            "--downloader", "http:aria2c",
+            "--downloader", "https:aria2c",
+            "--downloader-args", f"aria2c:-x {conns} -s {conns} -k 1M --disable-ipv6=true --file-allocation=none --connect-timeout=20 --timeout=30 --max-tries=5 --retry-wait=2 --show-console-readout=true --summary-interval=1"
         ])
 
     if impersonate:
@@ -687,10 +707,16 @@ def run_process_with_heartbeat(
     cmd: List[str],
     job_id: str,
     phase_detail: str,
-    timeout_sec: float = 1200.0,
-    heartbeat_interval: float = 1.5
+    timeout_sec: float = 2100.0,
+    heartbeat_interval: float = 1.5,
+    stall_timeout_sec: Optional[float] = 120.0,
+    watch_dir: Optional[str] = None
 ) -> Tuple[int, str]:
     global _CURRENT_SUBPROC
+
+    env = os.environ.copy()
+    env.update({"TERM": "dumb", "NO_COLOR": "1", "CI": "1"})
+
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -698,7 +724,8 @@ def run_process_with_heartbeat(
         stderr=subprocess.STDOUT,
         text=True,
         errors="replace",
-        bufsize=1
+        bufsize=1,
+        env=env
     )
     _CURRENT_SUBPROC = proc
 
@@ -706,7 +733,29 @@ def run_process_with_heartbeat(
     latest_prog: Dict[str, Any] = {}
     prog_lock = threading.Lock()
 
+    last_activity = time.monotonic()
+    last_reported_dl_bytes = 0
+    last_reported_dl_pct = 0.0
+
+    def get_watch_dir_bytes(wdir: Optional[str]) -> int:
+        if not wdir or not os.path.isdir(wdir):
+            return 0
+        total = 0
+        try:
+            for entry in os.scandir(wdir):
+                if entry.is_file(follow_symlinks=False):
+                    try:
+                        total += entry.stat().st_size
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
+    last_disk_bytes = get_watch_dir_bytes(watch_dir)
+
     def reader():
+        nonlocal last_activity, last_reported_dl_bytes, last_reported_dl_pct
         try:
             if proc.stdout:
                 for line in proc.stdout:
@@ -718,6 +767,16 @@ def run_process_with_heartbeat(
                     if prog:
                         with prog_lock:
                             latest_prog.update(prog)
+                            dl_b = prog.get("downloaded_bytes", 0)
+                            dl_p = prog.get("dl_pct", 0.0)
+                            if dl_b > last_reported_dl_bytes or dl_p > last_reported_dl_pct:
+                                last_reported_dl_bytes = max(last_reported_dl_bytes, dl_b)
+                                last_reported_dl_pct = max(last_reported_dl_pct, dl_p)
+                                last_activity = time.monotonic()
+                    else:
+                        with prog_lock:
+                            if latest_prog.get("downloaded_bytes", 0) == 0:
+                                last_activity = time.monotonic()
         except Exception:
             pass
 
@@ -731,6 +790,20 @@ def run_process_with_heartbeat(
         while proc.poll() is None:
             time.sleep(0.3)
             now = time.monotonic()
+
+            if watch_dir:
+                cur_disk_bytes = get_watch_dir_bytes(watch_dir)
+                if cur_disk_bytes > last_disk_bytes:
+                    last_disk_bytes = cur_disk_bytes
+                    last_activity = now
+
+            if stall_timeout_sec is not None and (now - last_activity > stall_timeout_sec):
+                proc.kill()
+                _CURRENT_SUBPROC = None
+                t.join(timeout=2.0)
+                stderr_text = "\n".join(tail_lines)
+                return 124, stderr_text + "\nProcess stalled with no progress"
+
             if now - start_time > timeout_sec:
                 proc.kill()
                 _CURRENT_SUBPROC = None
@@ -742,7 +815,7 @@ def run_process_with_heartbeat(
                     cur_prog = dict(latest_prog)
 
                 dl_pct = cur_prog.get("dl_pct", 0.0)
-                overall_prog = min(50.0, dl_pct * 0.5)
+                overall_prog = min(99.0, max(0.0, dl_pct))
 
                 update_payload: Dict[str, Any] = {
                     "progress": overall_prog,
@@ -964,10 +1037,12 @@ def resolve_with_playwright(
             is_dash = ".mpd" in t_low
             ct = (headers.get("content-type") if headers else "") or ""
             ct_low = ct.lower()
-            is_mp4 = ".mp4" in t_low or "video/mp4" in ct_low
-            is_webm = ".webm" in t_low or "video/webm" in ct_low
+            is_direct_media = (
+                any(t_low.endswith(ext) or (f"{ext}?" in t_low) for ext in (".mp4", ".webm", ".mkv", ".mov", ".m4v"))
+                or ("video/" in ct_low and "video/mp2t" not in ct_low)
+            )
 
-            if is_master or is_hls or is_dash or is_mp4 or is_webm:
+            if is_master or is_hls or is_dash or is_direct_media:
                 if is_master and status in (200, 206):
                     prio = 0
                 elif is_hls and status in (200, 206):
@@ -978,7 +1053,7 @@ def resolve_with_playwright(
                     prio = 3
                 elif is_dash:
                     prio = 4
-                elif (is_mp4 or is_webm) and status in (200, 206):
+                elif is_direct_media and status in (200, 206):
                     prio = 5
                 else:
                     prio = 6
@@ -1036,6 +1111,14 @@ def resolve_with_playwright(
                     if any(s["prio"] <= 1 for s in found_streams):
                         break
                     time.sleep(0.5)
+
+            if not found_streams:
+                try:
+                    src_val = page.locator('video source[src], video[src]').first.get_attribute('src')
+                    if src_val and src_val.startswith(("http://", "https://")) and is_ssrf_safe_url(src_val):
+                        check_stream(src_val, 200, {})
+                except Exception:
+                    pass
 
             if found_streams:
                 break
@@ -1252,10 +1335,46 @@ def _strip_media_ext(name: str) -> str:
     return name
 
 
-def _detect_cyberdrop_dir_flag(cyberdrop_bin: str) -> str:
-    global _CYBERDROP_DIR_FLAG
-    if _CYBERDROP_DIR_FLAG:
-        return _CYBERDROP_DIR_FLAG
+_CYBERDROP_CLI_CONFIG: Optional[Dict[str, Any]] = None
+
+
+def _probe_cyberdrop_cli(cyberdrop_bin: str) -> Dict[str, Any]:
+    global _CYBERDROP_CLI_CONFIG
+    if _CYBERDROP_CLI_CONFIG is not None:
+        return _CYBERDROP_CLI_CONFIG
+
+    config: Dict[str, Any] = {
+        "has_download_subcmd": False,
+        "dir_flag": "--download-folder",
+        "has_appdata_flag": False,
+        "has_ui_flag": False,
+    }
+
+    try:
+        res = subprocess.run(
+            [cyberdrop_bin, "download", "--help"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10
+        )
+        help_text = (res.stdout or "") + (res.stderr or "")
+        if res.returncode == 0 and any(flag in help_text for flag in ("--download-folder", "-d", "-o")):
+            config["has_download_subcmd"] = True
+            if "--download-folder" in help_text:
+                config["dir_flag"] = "--download-folder"
+            elif "-d" in help_text:
+                config["dir_flag"] = "-d"
+            elif "-o" in help_text:
+                config["dir_flag"] = "-o"
+            config["has_appdata_flag"] = "--appdata-folder" in help_text
+            config["has_ui_flag"] = "--ui" in help_text
+            _CYBERDROP_CLI_CONFIG = config
+            return config
+    except Exception:
+        pass
+
     try:
         res = subprocess.run(
             [cyberdrop_bin, "--help"],
@@ -1267,23 +1386,49 @@ def _detect_cyberdrop_dir_flag(cyberdrop_bin: str) -> str:
         )
         help_text = (res.stdout or "") + (res.stderr or "")
         if "--download-folder" in help_text:
-            _CYBERDROP_DIR_FLAG = "--download-folder"
-        elif "-d" in help_text or "--dir" in help_text:
-            _CYBERDROP_DIR_FLAG = "-d"
-        elif "-o" in help_text or "--output" in help_text:
-            _CYBERDROP_DIR_FLAG = "-o"
-        else:
-            _CYBERDROP_DIR_FLAG = "--download-folder"
+            config["dir_flag"] = "--download-folder"
+        elif "-d" in help_text:
+            config["dir_flag"] = "-d"
+        elif "-o" in help_text:
+            config["dir_flag"] = "-o"
+        config["has_appdata_flag"] = "--appdata-folder" in help_text
+        config["has_ui_flag"] = "--ui" in help_text
     except Exception:
-        _CYBERDROP_DIR_FLAG = "--download-folder"
-    return _CYBERDROP_DIR_FLAG
+        pass
+
+    _CYBERDROP_CLI_CONFIG = config
+    return config
+
+
+def _build_cyberdrop_cmd(
+    cyberdrop_bin: str,
+    job_dir: str,
+    appdata_dir: str,
+    raw_url: str
+) -> List[str]:
+    cfg = _probe_cyberdrop_cli(cyberdrop_bin)
+    cmd: List[str] = [cyberdrop_bin]
+    if cfg["has_download_subcmd"]:
+        cmd.append("download")
+
+    cmd.extend([cfg["dir_flag"], job_dir])
+
+    if cfg["has_appdata_flag"]:
+        os.makedirs(appdata_dir, exist_ok=True)
+        cmd.extend(["--appdata-folder", appdata_dir])
+
+    if cfg["has_ui_flag"]:
+        cmd.extend(["--ui", "disabled"])
+
+    cmd.append(raw_url)
+    return cmd
 
 
 def resolve_signed_media_item(
     item_url: str,
     cookies: str = "",
     user_agent: str = ""
-) -> Optional[Dict[str, str]]:
+) -> Optional[Dict[str, Any]]:
     if not is_ssrf_safe_url(item_url):
         return None
 
@@ -1296,34 +1441,79 @@ def resolve_signed_media_item(
         headers["Cookie"] = cookies
 
     page_html = ""
-    try:
-        from curl_cffi import requests as cffi_requests
-        resp = cffi_requests.get(item_url, headers=headers, impersonate="chrome", timeout=20)
-        if resp.status_code == 200:
-            page_html = resp.text
-    except Exception:
-        page_html = ""
+    for attempt in range(3):
+        try:
+            from curl_cffi import requests as cffi_requests
+            resp = cffi_requests.get(item_url, headers=headers, impersonate="chrome", timeout=20)
+            if resp.status_code == 200:
+                page_html = resp.text
+                break
+            elif resp.status_code in (429, 502, 503, 504) and attempt < 2:
+                time.sleep(1.5 if attempt == 0 else 3.0)
+                continue
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.5 if attempt == 0 else 3.0)
+                continue
+            page_html = ""
 
     if not page_html:
-        try:
-            req = urllib.request.Request(item_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=20) as u_resp:
-                if u_resp.status == 200:
-                    page_html = u_resp.read().decode("utf-8", errors="replace")
-        except Exception:
-            return None
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(item_url, headers=headers)
+                with urllib.request.urlopen(req, timeout=20) as u_resp:
+                    if u_resp.status == 200:
+                        page_html = u_resp.read().decode("utf-8", errors="replace")
+                        break
+                    elif u_resp.status in (429, 502, 503, 504) and attempt < 1:
+                        time.sleep(1.5)
+                        continue
+            except urllib.error.HTTPError as he:
+                if he.code in (429, 502, 503, 504) and attempt < 1:
+                    time.sleep(1.5)
+                    continue
+                return None
+            except Exception:
+                if attempt < 1:
+                    time.sleep(1.5)
+                    continue
+                return None
 
     if not page_html:
         return None
 
     body_low = page_html[:8000].lower()
     if "unavailable for maintenance" in body_low or "maintenance is in progress" in body_low:
-        return None
+        return {"is_maintenance": True}
 
-    m_cdn = re.search(r'jsCDN\s*=\s*"([^"]+)"', page_html)
-    m_sign = re.search(r'signUrl\s*=\s*"([^"]+)"', page_html)
+    m_cdn = re.search(r'jsCDN\s*=\s*["\']([^"\']+)["\']', page_html)
+    m_sign = re.search(r'signUrl\s*=\s*["\']([^"\']+)["\']', page_html)
 
     if not m_cdn or not m_sign:
+        # Check direct media links in HTML (<source> or <video>)
+        m_src = re.search(
+            r'<(?:source|video)[^>]+src=["\'](https?://[^"\']+\.(?:mp4|mkv|webm|mov|m4v)(?:\?[^"\']*)?)["\']',
+            page_html,
+            re.IGNORECASE
+        )
+        if m_src:
+            direct_url = m_src.group(1).replace(r"\/", "/")
+            if is_ssrf_safe_url(direct_url):
+                extracted_name = ""
+                m_h1 = re.search(r'<h1[^>]*>([^<]+)</h1>', page_html, re.IGNORECASE)
+                if m_h1:
+                    extracted_name = m_h1.group(1).strip()
+                if not extracted_name:
+                    m_title = re.search(r'<title[^>]*>([^<]+)</title>', page_html, re.IGNORECASE)
+                    if m_title:
+                        extracted_name = m_title.group(1).strip()
+                if not extracted_name:
+                    extracted_name = os.path.basename(urllib.parse.urlparse(direct_url).path)
+                return {
+                    "url": direct_url,
+                    "filename": extracted_name,
+                    "referer": item_url
+                }
         return None
 
     js_cdn = m_cdn.group(1).replace(r"\/", "/")
@@ -1334,7 +1524,12 @@ def resolve_signed_media_item(
         return None
 
     sign_host = (parsed_sign.hostname or "").lower()
-    if not any(sign_host == h or sign_host.endswith(f".{h}") for h in ALLOWED_SIGN_HOSTS):
+    is_valid_sign = (
+        sign_host == "cdn.cr"
+        or sign_host.endswith(".cdn.cr")
+        or bool(re.match(r"^([a-z0-9-]+\.)*bunkrr?\.[a-z]{2,6}$", sign_host))
+    )
+    if not is_valid_sign:
         return None
 
     parsed_cdn = urllib.parse.urlparse(js_cdn)
@@ -1347,22 +1542,43 @@ def resolve_signed_media_item(
         return None
 
     sign_json: Dict[str, Any] = {}
-    try:
-        from curl_cffi import requests as cffi_requests
-        s_resp = cffi_requests.get(sign_req_url, headers=headers, impersonate="chrome", timeout=20)
-        if s_resp.status_code == 200:
-            sign_json = s_resp.json()
-    except Exception:
-        sign_json = {}
+    for attempt in range(3):
+        try:
+            from curl_cffi import requests as cffi_requests
+            s_resp = cffi_requests.get(sign_req_url, headers=headers, impersonate="chrome", timeout=20)
+            if s_resp.status_code == 200:
+                sign_json = s_resp.json()
+                break
+            elif s_resp.status_code in (429, 502, 503, 504) and attempt < 2:
+                time.sleep(1.5 if attempt == 0 else 3.0)
+                continue
+        except Exception:
+            if attempt < 2:
+                time.sleep(1.5 if attempt == 0 else 3.0)
+                continue
+            sign_json = {}
 
     if not sign_json:
-        try:
-            req_sign = urllib.request.Request(sign_req_url, headers=headers)
-            with urllib.request.urlopen(req_sign, timeout=20) as s_resp2:
-                if s_resp2.status == 200:
-                    sign_json = json.loads(s_resp2.read().decode("utf-8", errors="replace"))
-        except Exception:
-            return None
+        for attempt in range(2):
+            try:
+                req_sign = urllib.request.Request(sign_req_url, headers=headers)
+                with urllib.request.urlopen(req_sign, timeout=20) as s_resp2:
+                    if s_resp2.status == 200:
+                        sign_json = json.loads(s_resp2.read().decode("utf-8", errors="replace"))
+                        break
+                    elif s_resp2.status in (429, 502, 503, 504) and attempt < 1:
+                        time.sleep(1.5)
+                        continue
+            except urllib.error.HTTPError as he:
+                if he.code in (429, 502, 503, 504) and attempt < 1:
+                    time.sleep(1.5)
+                    continue
+                return None
+            except Exception:
+                if attempt < 1:
+                    time.sleep(1.5)
+                    continue
+                return None
 
     token = sign_json.get("token")
     ex = sign_json.get("ex")
@@ -1440,7 +1656,8 @@ def download_direct_with_aria2_or_curl(
 
     aria2_bin = shutil.which("aria2c")
     if aria2_bin:
-        cmd = [
+        # Step 1: 16 connections
+        cmd_16 = [
             aria2_bin,
             "-x", "16",
             "-s", "16",
@@ -1460,16 +1677,56 @@ def download_direct_with_aria2_or_curl(
             f"--user-agent={ua}"
         ]
         if referer:
-            cmd.append(f"--header=Referer: {referer}")
+            cmd_16.append(f"--header=Referer: {referer}")
         if cookies:
-            cmd.append(f"--header=Cookie: {cookies}")
-        cmd.append(url)
+            cmd_16.append(f"--header=Cookie: {cookies}")
+        cmd_16.append(url)
 
-        ret, stderr_text = run_process_with_heartbeat(cmd, job_id, "Downloading directly via aria2c...", timeout_sec=1200)
+        ret, stderr_text = run_process_with_heartbeat(
+            cmd_16, job_id, "Downloading directly via aria2c (16 conns)...",
+            timeout_sec=2100.0, watch_dir=job_dir
+        )
         target_path = pathlib.Path(job_dir) / target_fn
         if ret == 0 and target_path.is_file() and target_path.stat().st_size > 50 * 1024:
             return True
 
+        # Step 2: Retry with 4 connections
+        _clear_job_dir(job_dir)
+        cmd_4 = [
+            aria2_bin,
+            "-x", "4",
+            "-s", "4",
+            "-k", "1M",
+            "--disable-ipv6=true",
+            "--max-tries=5",
+            "--retry-wait=2",
+            "--allow-overwrite=true",
+            "--auto-file-renaming=false",
+            "--file-allocation=none",
+            "--connect-timeout=20",
+            "--timeout=30",
+            "--show-console-readout=true",
+            "--summary-interval=1",
+            "--dir", job_dir,
+            "--out", target_fn,
+            f"--user-agent={ua}"
+        ]
+        if referer:
+            cmd_4.append(f"--header=Referer: {referer}")
+        if cookies:
+            cmd_4.append(f"--header=Cookie: {cookies}")
+        cmd_4.append(url)
+
+        ret4, stderr4 = run_process_with_heartbeat(
+            cmd_4, job_id, "Downloading directly via aria2c (4 conns)...",
+            timeout_sec=2100.0, watch_dir=job_dir
+        )
+        target_path = pathlib.Path(job_dir) / target_fn
+        if ret4 == 0 and target_path.is_file() and target_path.stat().st_size > 50 * 1024:
+            return True
+
+    # Step 3: Clear job_dir before urllib fallback
+    _clear_job_dir(job_dir)
     target_path = pathlib.Path(job_dir) / target_fn
     headers = {"User-Agent": ua}
     if referer:
@@ -1492,6 +1749,7 @@ def download_direct_with_aria2_or_curl(
                             target_path = pathlib.Path(job_dir) / target_fn
 
                 dl_bytes = 0
+                last_hb_bytes = 0
                 last_active = time.monotonic()
                 last_hb = time.monotonic()
                 with open(target_path, "wb") as out_f:
@@ -1502,13 +1760,21 @@ def download_direct_with_aria2_or_curl(
                         out_f.write(chunk)
                         dl_bytes += len(chunk)
                         last_active = time.monotonic()
-                        if last_active - last_hb >= 1.5:
-                            last_hb = last_active
+                        now = time.monotonic()
+                        if now - last_hb >= 1.5:
+                            elapsed = max(0.001, now - last_hb)
+                            bytes_diff = dl_bytes - last_hb_bytes
+                            speed_bps = bytes_diff / elapsed
+                            speed_text = f"{speed_bps / (1024 * 1024):.1f} MB/s" if speed_bps >= 1024 * 1024 else f"{speed_bps / 1024:.0f} KB/s"
+                            last_hb = now
+                            last_hb_bytes = dl_bytes
+
                             dl_pct = (dl_bytes / tot_len * 100.0) if tot_len > 0 else 0.0
                             call_api(f"/internal/update/{job_id}", {
-                                "progress": min(50.0, dl_pct * 0.5),
+                                "progress": min(99.0, max(0.0, dl_pct)),
                                 "downloaded_bytes": dl_bytes,
                                 "total_bytes": tot_len,
+                                "speed_text": speed_text,
                                 "phase_detail": "Downloading"
                             })
                         if time.monotonic() - last_active > 25:
@@ -1534,7 +1800,7 @@ def is_valid_upload_candidate(
     forbidden_suffixes = {
         ".unknown_video", ".html", ".htm", ".xhtml", ".part",
         ".ytdl", ".tmp", ".log", ".db", ".sqlite", ".sqlite3",
-        ".ini", ".cfg", ".yaml", ".yml"
+        ".ini", ".cfg", ".yaml", ".yml", ".aria2"
     }
     if suffix_low in forbidden_suffixes:
         return False, f"Forbidden file extension: {suffix_low}"
@@ -1602,6 +1868,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
 
     root_host = extract_root_host(raw_url)
     job_dir = f"/tmp/drivegrab/{job_id}"
+    cdl_appdata_dir = f"/tmp/drivegrab/cdl_app_{job_id}"
     os.makedirs(job_dir, exist_ok=True)
 
     try:
@@ -1638,6 +1905,8 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                     "phase_detail": "Resolving signed CDN direct media..."
                 })
                 resolved = resolve_signed_media_item(raw_url, cookies=cookies or "", user_agent=user_agent or "")
+                if resolved and resolved.get("is_maintenance"):
+                    raise RuntimeError("Host server is currently under maintenance")
                 if resolved and resolved.get("url"):
                     direct_url = resolved["url"]
                     pref_name = resolved.get("filename") or safe_name
@@ -1650,9 +1919,11 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             # Step 2: Cyberdrop-dl invocation
             if not success:
                 cyberdrop_bin = shutil.which("cyberdrop-dl") or str(pathlib.Path(sys.executable).parent / "cyberdrop-dl")
-                dir_flag = _detect_cyberdrop_dir_flag(cyberdrop_bin)
-                cd_cmd = [cyberdrop_bin, dir_flag, job_dir, raw_url]
-                ret, stderr_text = run_process_with_heartbeat(cd_cmd, job_id, "Downloading via cyberdrop-dl...", timeout_sec=900)
+                cd_cmd = _build_cyberdrop_cmd(cyberdrop_bin, job_dir, cdl_appdata_dir, raw_url)
+                ret, stderr_text = run_process_with_heartbeat(
+                    cd_cmd, job_id, "Downloading via cyberdrop-dl...",
+                    timeout_sec=900.0, watch_dir=job_dir
+                )
                 if "429" in stderr_text or "Too Many Requests" in stderr_text:
                     report_host_cooldown(root_host, 60, "Rate limited (429)")
                 if ret == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
@@ -1675,8 +1946,15 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                         referer=pw_ref, cookies=pw_cook, user_agent=pw_ua
                     )
                     if not success:
-                        cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook, use_aria2=True)
-                        ret_pw, stderr_pw = run_process_with_heartbeat(cmd_pw, job_id, "Downloading resolved stream...", timeout_sec=900)
+                        _clear_job_dir(job_dir)
+                        cmd_pw = build_ytdlp_cmd(
+                            stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook,
+                            use_aria2=True, aria2_conns=16
+                        )
+                        ret_pw, stderr_pw = run_process_with_heartbeat(
+                            cmd_pw, job_id, "Downloading resolved stream...",
+                            timeout_sec=900.0, watch_dir=job_dir
+                        )
                         if ret_pw == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
                             success = True
                         else:
@@ -1689,25 +1967,57 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
         elif plugin == "gallery-dl":
             gallery_dl_bin = shutil.which("gallery-dl") or str(pathlib.Path(sys.executable).parent / "gallery-dl")
             g_cmd = [gallery_dl_bin, "-d", job_dir, raw_url]
-            ret, stderr_text = run_process_with_heartbeat(g_cmd, job_id, "Downloading via gallery-dl...", timeout_sec=900)
+            ret, stderr_text = run_process_with_heartbeat(
+                g_cmd, job_id, "Downloading via gallery-dl...",
+                timeout_sec=900.0, watch_dir=job_dir
+            )
             if "429" in stderr_text or "Too Many Requests" in stderr_text:
                 report_host_cooldown(root_host, 60, "Rate limited (429)")
             if ret == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
                 success = True
 
         else:
-            # Generic yt-dlp lane (with aria2 and single-connection retry guard)
-            cmd = build_ytdlp_cmd(raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies, use_aria2=True)
-            ret, stderr_text = run_process_with_heartbeat(cmd, job_id, "Downloading via yt-dlp...", timeout_sec=1200)
+            # Generic yt-dlp lane (with stepped aria2 connection ladder: 16 -> 4 -> 1)
+            cmd = build_ytdlp_cmd(
+                raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies,
+                use_aria2=True, aria2_conns=16
+            )
+            ret, stderr_text = run_process_with_heartbeat(
+                cmd, job_id, "Downloading via yt-dlp...",
+                timeout_sec=2100.0, watch_dir=job_dir
+            )
 
-            # Single-connection retry guard: If aria2c was used and exited non-zero, retry once with use_aria2=False
+            # Step 2: Retry with 4 connections if 16 connections failed
             if ret != 0 and "--downloader" in cmd:
+                _clear_job_dir(job_dir)
+                log_state(job_id, "retry_4_connections")
+                call_api(f"/internal/update/{job_id}", {
+                    "phase_detail": "Retrying with 4 connections..."
+                })
+                cmd_4 = build_ytdlp_cmd(
+                    raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies,
+                    use_aria2=True, aria2_conns=4
+                )
+                ret, stderr_text = run_process_with_heartbeat(
+                    cmd_4, job_id, "Downloading via yt-dlp (4 connections)...",
+                    timeout_sec=2100.0, watch_dir=job_dir
+                )
+
+            # Step 3: Retry with single connection if aria2 was used and failed
+            if ret != 0 and "--downloader" in cmd:
+                _clear_job_dir(job_dir)
                 log_state(job_id, "retry_single_connection")
                 call_api(f"/internal/update/{job_id}", {
-                    "phase_detail": "Retrying with standard progressive connection..."
+                    "phase_detail": "Retrying with standard connection..."
                 })
-                cmd_single = build_ytdlp_cmd(raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies, use_aria2=False)
-                ret, stderr_text = run_process_with_heartbeat(cmd_single, job_id, "Downloading via yt-dlp (single connection)...", timeout_sec=1200)
+                cmd_single = build_ytdlp_cmd(
+                    raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies,
+                    use_aria2=False
+                )
+                ret, stderr_text = run_process_with_heartbeat(
+                    cmd_single, job_id, "Downloading via yt-dlp (standard connection)...",
+                    timeout_sec=2100.0, watch_dir=job_dir
+                )
 
             if "429" in stderr_text or "Too Many Requests" in stderr_text:
                 report_host_cooldown(root_host, 60, "Rate limited (429)")
@@ -1718,31 +2028,37 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             # Fallback handling for crawled item vs sniffed CDN
             if not success:
                 if is_crawled_item:
-                    # Crawled item: raw_url is the actual item watch page
+                    _clear_job_dir(job_dir)
                     log_state(job_id, "item_impersonate_fallback")
                     call_api(f"/internal/update/{job_id}", {
                         "phase_detail": "Resolving crawled item with browser impersonation..."
                     })
                     cmd_impersonate = build_ytdlp_cmd(
                         raw_url, job_dir, out_tmpl, target_height, None, referer, cookies,
-                        use_aria2=True, impersonate="chrome"
+                        use_aria2=True, impersonate="chrome", aria2_conns=16
                     )
-                    ret_imp, stderr_imp = run_process_with_heartbeat(cmd_impersonate, job_id, "Downloading item via browser impersonation...", timeout_sec=900)
+                    ret_imp, stderr_imp = run_process_with_heartbeat(
+                        cmd_impersonate, job_id, "Downloading item via browser impersonation...",
+                        timeout_sec=900.0, watch_dir=job_dir
+                    )
                     if ret_imp == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
                         success = True
                     else:
                         stderr_text += f"\n{stderr_imp}"
                 elif page_url and page_url != raw_url:
-                    # Sniffed CDN: page_url is the watch page
+                    _clear_job_dir(job_dir)
                     log_state(job_id, "page_fallback")
                     call_api(f"/internal/update/{job_id}", {
                         "phase_detail": "CDN stalled — resolving via page extractor..."
                     })
                     cmd_fallback = build_ytdlp_cmd(
                         page_url, job_dir, out_tmpl, target_height, None, page_url, cookies,
-                        use_aria2=True, impersonate="chrome"
+                        use_aria2=True, impersonate="chrome", aria2_conns=16
                     )
-                    ret_fb, stderr_fb = run_process_with_heartbeat(cmd_fallback, job_id, "Downloading via page extractor...", timeout_sec=900)
+                    ret_fb, stderr_fb = run_process_with_heartbeat(
+                        cmd_fallback, job_id, "Downloading via page extractor...",
+                        timeout_sec=900.0, watch_dir=job_dir
+                    )
                     if ret_fb == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
                         success = True
                     else:
@@ -1750,6 +2066,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
 
             # Playwright fallback if still not succeeded
             if not success:
+                _clear_job_dir(job_dir)
                 log_state(job_id, "resolving_stream")
                 call_api(f"/internal/update/{job_id}", {
                     "phase_detail": "Resolving stream via headless browser..."
@@ -1767,8 +2084,14 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                     pw_ref = pw_stream.get("referer") or referer
                     pw_cook = pw_stream.get("cookies") or cookies
                     pw_ua = pw_stream.get("user_agent") or user_agent
-                    cmd_pw = build_ytdlp_cmd(stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook, use_aria2=True)
-                    ret_pw, stderr_pw = run_process_with_heartbeat(cmd_pw, job_id, "Downloading resolved stream...", timeout_sec=900)
+                    cmd_pw = build_ytdlp_cmd(
+                        stream_url, job_dir, out_tmpl, target_height, pw_ua, pw_ref, pw_cook,
+                        use_aria2=True, aria2_conns=16
+                    )
+                    ret_pw, stderr_pw = run_process_with_heartbeat(
+                        cmd_pw, job_id, "Downloading resolved stream...",
+                        timeout_sec=900.0, watch_dir=job_dir
+                    )
                     if ret_pw == 0 and len(valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)) > 0:
                         success = True
                     else:
@@ -1820,6 +2143,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                 call_api(f"/internal/update/{job_id}", {
                     "status": "completed",
                     "progress": 100.0,
+                    "speed_text": "",
                     "phase_detail": f"Extracted and saved {len(extracted_files)} files to Drive"
                 })
                 return
@@ -1841,8 +2165,11 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
         call_api(f"/internal/update/{job_id}", {
             "status": "uploading_to_gdrive",
             "filename": final_fn,
+            "progress": 0.0,
+            "downloaded_bytes": 0,
             "total_bytes": fsize,
-            "phase_detail": "Uploading to Google Drive (32 MiB chunks)..."
+            "speed_text": "",
+            "phase_detail": "Uploading"
         })
 
         def on_upload_prog(pct, uploaded_b, tot_b, speed_text=""):
@@ -1867,6 +2194,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
             "downloaded_bytes": fsize,
             "total_bytes": fsize,
             "verified_size_bytes": fsize,
+            "speed_text": "",
             "phase_detail": "Saved to Drive"
         })
 
@@ -1878,11 +2206,13 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
         clean_err = sanitize_text(str(e))
         call_api(f"/internal/update/{job_id}", {
             "status": "failed",
-            "error": clean_err
+            "error": clean_err,
+            "speed_text": ""
         })
         raise
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
+        shutil.rmtree(cdl_appdata_dir, ignore_errors=True)
 
 
 def execute_batch_direct(job: Dict[str, Any], uploader: GoogleDriveUploader) -> None:
