@@ -652,6 +652,7 @@ def build_ytdlp_cmd(
     use_aria2: bool = True,
     impersonate: Optional[str] = None,
     aria2_conns: int = 16,
+    allow_unsafe_ext: bool = False,
 ) -> List[str]:
     format_spec = f"bv*[height<={target_height}][ext=mp4]+ba[ext=m4a]/b[height<={target_height}][ext=mp4]/bv*[height<={target_height}]+ba/b[height<={target_height}]/best"
     cmd = [
@@ -674,8 +675,9 @@ def build_ytdlp_cmd(
     parsed_path = (urllib.parse.urlparse(target_url).path or "").lower()
     url_low = target_url.lower()
     is_manifest = parsed_path.endswith((".m3u8", ".m3u", ".mpd"))
+    is_php_endpoint = parsed_path.endswith((".php", ".php5", ".phtml", ".ashx"))
     is_tokenized_php = (
-        parsed_path.endswith(".php")
+        is_php_endpoint
         or "acctoken=" in url_low
         or "download=true" in url_low
         or "/get_file/" in parsed_path
@@ -698,6 +700,9 @@ def build_ytdlp_cmd(
         cmd.extend(["--add-header", f"Referer:{referer}"])
     if cookies:
         cmd.extend(["--add-header", f"Cookie:{cookies}"])
+
+    if allow_unsafe_ext or is_php_endpoint:
+        cmd.extend(["--compat-options", "allow-unsafe-ext"])
 
     cmd.extend(["--", target_url])
     return cmd
@@ -1800,7 +1805,8 @@ def is_valid_upload_candidate(
     forbidden_suffixes = {
         ".unknown_video", ".html", ".htm", ".xhtml", ".part",
         ".ytdl", ".tmp", ".log", ".db", ".sqlite", ".sqlite3",
-        ".ini", ".cfg", ".yaml", ".yml", ".aria2"
+        ".ini", ".cfg", ".yaml", ".yml", ".aria2",
+        ".php", ".php5", ".phtml", ".ashx", ".cgi", ".aspx", ".asp", ".jsp"
     }
     if suffix_low in forbidden_suffixes:
         return False, f"Forbidden file extension: {suffix_low}"
@@ -1837,11 +1843,76 @@ def is_valid_upload_candidate(
     return True, ""
 
 
+def _normalize_unusual_video_ext(job_dir: str) -> None:
+    """Probes unusual/empty-extension downloads via ffprobe and renames verified video files."""
+    target_suffixes = {
+        ".php", ".php5", ".phtml", ".ashx", ".cgi", ".aspx", ".asp", ".jsp",
+        ".bin", ".unknown_video", ""
+    }
+    skip_prefixes = (
+        b"<!doc", b"<html", b"<head", b"<script", b"<?php", b"<?xml", b'{"error'
+    )
+    job_path = pathlib.Path(job_dir)
+    if not job_path.exists():
+        return
+
+    for p in list(job_path.rglob("*")):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in target_suffixes:
+            continue
+        try:
+            if p.stat().st_size < 50 * 1024:
+                continue
+            with open(p, "rb") as f:
+                prefix = f.read(512).strip().lower()
+            if any(prefix.startswith(sp) for sp in skip_prefixes):
+                continue
+
+            proc = subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_type,codec_name:format=format_name",
+                    "-of", "json", str(p)
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            if proc.returncode != 0:
+                continue
+            info = json.loads(proc.stdout.decode("utf-8", errors="replace"))
+            streams = info.get("streams") or []
+            if not any(s.get("codec_type") == "video" for s in streams):
+                continue
+
+            fmt_name = (info.get("format") or {}).get("format_name", "").lower()
+            if "webm" in fmt_name:
+                ext = ".webm"
+            elif "matroska" in fmt_name:
+                ext = ".mkv"
+            else:
+                ext = ".mp4"
+
+            base_stem = p.stem or "video"
+            target = p.with_name(f"{base_stem}{ext}")
+            idx = 1
+            while target.exists() and target != p:
+                target = p.with_name(f"{base_stem}_{idx}{ext}")
+                idx += 1
+            if target != p:
+                p.rename(target)
+        except Exception:
+            continue
+
+
 def valid_upload_candidates(
     job_dir: str,
     plugin: str,
     expected_is_direct_doc: bool
 ) -> List[pathlib.Path]:
+    _normalize_unusual_video_ext(job_dir)
     candidates = []
     for f in pathlib.Path(job_dir).rglob("*"):
         if f.is_file():
@@ -2018,6 +2089,20 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                     cmd_single, job_id, "Downloading via yt-dlp (standard connection)...",
                     timeout_sec=2100.0, watch_dir=job_dir
                 )
+                cmd = cmd_single
+
+            # Step 4: Retry once with allow-unsafe-ext if yt-dlp skipped unusual extension
+            if ret != 0 and "unusual and will be skipped for safety reasons" in stderr_text and "--compat-options" not in cmd:
+                _clear_job_dir(job_dir)
+                log_state(job_id, "retry_allow_unsafe_ext")
+                cmd_unsafe = build_ytdlp_cmd(
+                    raw_url, job_dir, out_tmpl, target_height, user_agent, referer, cookies,
+                    use_aria2=False, allow_unsafe_ext=True
+                )
+                ret, stderr_text = run_process_with_heartbeat(
+                    cmd_unsafe, job_id, "Retrying unusual extension stream...",
+                    timeout_sec=2100.0, watch_dir=job_dir
+                )
 
             if "429" in stderr_text or "Too Many Requests" in stderr_text:
                 report_host_cooldown(root_host, 60, "Rate limited (429)")
@@ -2097,6 +2182,7 @@ def execute_single_download(job: Dict[str, Any], uploader: GoogleDriveUploader) 
                     else:
                         stderr_text += f"\n{stderr_pw}"
 
+        _normalize_unusual_video_ext(job_dir)
         downloaded_files = valid_upload_candidates(job_dir, plugin, expected_is_direct_doc)
         if not success or not downloaded_files:
             all_files = [f for f in pathlib.Path(job_dir).rglob("*") if f.is_file()]
